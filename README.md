@@ -1,4 +1,4 @@
-### General notes  12-15-25
+### General notes  12-15-25 ONE MORE TIME
 
 This is a bit of a hack, in that both the app and the database (MairaDB) are on the same image/container.
 
