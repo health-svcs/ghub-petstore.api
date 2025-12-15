@@ -1,4 +1,4 @@
-### General notes  12-12-25 - 1st 2 tests failled - checking one more time
+### General notes  12-15-25
 
 This is a bit of a hack, in that both the app and the database (MairaDB) are on the same image/container.
 
