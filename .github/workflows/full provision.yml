@@ -2,24 +2,84 @@ name: Provision EC2 + Build & Deploy petstore-api
 
 on:
   workflow_dispatch:
+    inputs:
+      TlsMode:
+        description: "TLS posture applied at deploy time (NGINX): Weak or Secure"
+        required: true
+        default: "Weak"
+        type: choice
+        options:
+          - Weak
+          - Secure
   push:
     branches: ["main"]
 
 env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPO: ${{ vars.ECR_REPO }}
-  IMAGE_TAG: latest
+
+  # ECR repo can be a variable; if missing, default to a sensible name
+  ECR_REPO: ${{ vars.ECR_REPO || 'petstore-api' }}
+
+  # Unique image tag per workflow run (prevents collisions across SAs)
+  IMAGE_TAG: ${{ github.run_id }}
+
   TEMPLATE_FILE: cloudformation/ec2.yaml
-  DEPLOY_TAG_KEY: ${{ vars.DEPLOY_TAG_KEY }}
-  DEPLOY_TAG_VALUE: ${{ vars.DEPLOY_TAG_VALUE }}
+
+  # Per-SA isolation tag (defaults to the person who triggered the run)
+  DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
 
 jobs:
+  ###############################
+  # 0. VALIDATE INPUTS          #
+  ###############################
+  validate-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required repo/org variables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require() {
+            local name="$1"
+            local val="$2"
+            if [[ -z "${val}" ]]; then
+              echo "ERROR: Required variable '${name}' is empty or not set."
+              exit 1
+            fi
+          }
+
+          require "AWS_ACCOUNT_ID" "${AWS_ACCOUNT_ID}"
+          require "AWS_REGION" "${AWS_REGION}"
+          require "ECR_REPO" "${ECR_REPO}"
+          require "AWS_ROLE_TO_ASSUME" "${{ vars.AWS_ROLE_TO_ASSUME }}"
+          require "AMI_ID" "${{ vars.AMI_ID }}"
+          require "INSTANCE_TYPE" "${{ vars.INSTANCE_TYPE }}"
+          require "SUBNET_ID" "${{ vars.SUBNET_ID }}"
+          require "SG_IDS" "${{ vars.SG_IDS }}"
+          require "INSTANCE_PROFILE_NAME" "${{ vars.INSTANCE_PROFILE_NAME }}"
+          require "KEY_NAME" "${{ vars.KEY_NAME }}"
+
+          echo "github.actor=${GITHUB_ACTOR}"
+          echo "Resolved DEMO_OWNER=${DEMO_OWNER}"
+
+          # Protect shared VRM tenant from scheduled/bot runs accidentally tagging everything as github-actions
+          if [[ "${DEMO_OWNER}" == "github-actions" || "${DEMO_OWNER}" == *"[bot]" ]]; then
+            echo "ERROR: Refusing to provision demo assets for automation actor: ${DEMO_OWNER}"
+            echo "If intentional, set repo/org variable DEMO_OWNER to a human/team value."
+            exit 1
+          fi
+
+          echo "Using IMAGE_TAG=${IMAGE_TAG}"
+          echo "All required variables present."
+
   ###############################
   # 1. PROVISION EC2 FROM AMI   #
   ###############################
   provision-ec2-cfn:
     runs-on: ubuntu-latest
+    needs: validate-inputs
     permissions:
       id-token: write
       contents: read
@@ -36,15 +96,20 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy CloudFormation stack (no line-continuations)
+      - name: Deploy CloudFormation stack (with TLS mode + DemoOwner tag + ImageTag)
         shell: bash
         run: |
           set -euo pipefail
           set -x
 
+          TLS_MODE_INPUT="${{ inputs.TlsMode || 'Weak' }}"
+
           echo "STACK_NAME='${STACK_NAME}'"
           echo "AWS_REGION='${AWS_REGION}'"
           echo "TEMPLATE_FILE='${TEMPLATE_FILE}'"
+          echo "DEMO_OWNER='${DEMO_OWNER}'"
+          echo "TlsMode='${TLS_MODE_INPUT}'"
+          echo "ImageTag='${IMAGE_TAG}'"
 
           ls -l "${TEMPLATE_FILE}"
           echo "----- tail of template -----"
@@ -62,8 +127,10 @@ jobs:
               "SecurityGroupIds=${{ vars.SG_IDS }}"
               "IamInstanceProfileName=${{ vars.INSTANCE_PROFILE_NAME }}"
               "KeyName=${{ vars.KEY_NAME }}"
-              "DeployTagKey=${{ vars.DEPLOY_TAG_KEY }}"
-              "DeployTagValue=${{ vars.DEPLOY_TAG_VALUE }}"
+              "DeployTagKey=DemoOwner"
+              "DeployTagValue=${DEMO_OWNER}"
+              "TlsMode=${TLS_MODE_INPUT}"
+              "ImageTag=${IMAGE_TAG}"
             --no-fail-on-empty-changeset
             --region "${AWS_REGION}"
           )
@@ -127,8 +194,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "IMAGE_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}" >> "$GITHUB_ENV"
-          echo "Using IMAGE_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
+          echo "Using IMAGE_URI=${IMAGE_URI}"
 
       - name: Ensure ECR repository exists
         shell: bash
