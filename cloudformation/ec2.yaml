@@ -20,12 +20,41 @@ Parameters:
   KeyName:
     Type: String
     Description: EC2 key pair
+
+  # Primary required tag (set by workflow)
   DeployTagKey:
     Type: String
-    Description: Tag key
+    Description: Tag key (workflow sets to DemoOwner)
   DeployTagValue:
     Type: String
-    Description: Tag value
+    Description: Tag value (workflow sets to github.actor or DEMO_OWNER)
+
+  # Recommended demo tags (safe defaults; can be overridden later)
+  AppName:
+    Type: String
+    Default: petstore-api
+    Description: App name tag for filtering/grouping
+
+  Environment:
+    Type: String
+    Default: QA
+    AllowedValues:
+      - Dev
+      - QA
+      - Prod
+    Description: Environment tag (helps asset drift / exec narratives)
+
+  Demo:
+    Type: String
+    Default: LiveDemo
+    Description: Demo tag for quick filtering/cleanup
+
+  # New: record which build/run deployed this instance
+  ImageTag:
+    Type: String
+    Default: unknown
+    Description: Image tag deployed (workflow should pass github.run_id)
+
   TlsMode:
     Type: String
     Default: Weak
@@ -44,9 +73,24 @@ Resources:
       SecurityGroupIds: !Ref SecurityGroupIds
       IamInstanceProfile: !Ref IamInstanceProfileName
       KeyName: !Ref KeyName
+
       Tags:
+        # Per-SA isolation key (DemoOwner=<actor>)
         - Key: !Ref DeployTagKey
           Value: !Ref DeployTagValue
+
+        # Minimal tag contract for shared VRM tenant
+        - Key: App
+          Value: !Ref AppName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Demo
+          Value: !Ref Demo
+        - Key: TlsMode
+          Value: !Ref TlsMode
+        - Key: ImageTag
+          Value: !Ref ImageTag
+
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -165,3 +209,7 @@ Outputs:
   TlsMode:
     Description: TLS posture applied at deploy time
     Value: !Ref TlsMode
+
+  ImageTag:
+    Description: Image tag recorded on the instance
+    Value: !Ref ImageTag
