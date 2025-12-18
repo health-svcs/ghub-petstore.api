@@ -36,8 +36,19 @@ env:
   # Per-SA isolation tag (defaults to the person who triggered the run)
   DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
 
-  # DNS
-  DNS_BASE_DOMAIN: ${{ vars.DNS_BASE_DOMAIN || 'sa.livedemo-us.com' }}
+  # Per-run SA acronym:
+  # - workflow_dispatch: inputs.SA_ACRONYM
+  # - push: vars.SA_ACRONYM_DEFAULT (you must create this repo var)
+  SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
+
+  # TLS mode:
+  # - workflow_dispatch: inputs.TlsMode
+  # - push: vars.TLSMODE_DEFAULT (optional repo var) else Weak
+  TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
+
+  # DNS (Route 53 for sa.livedemo-us.com)
+  HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID_SA }}
+  DNS_BASE_DOMAIN: ${{ vars.SA_BASE_DOMAIN }} # sa.livedemo-us.com
   DNS_TTL: ${{ vars.DNS_TTL || '60' }}
 
 jobs:
@@ -73,10 +84,15 @@ jobs:
           require "KEY_NAME" "${{ vars.KEY_NAME }}"
 
           # DNS vars (required for Route 53 updates)
-          require "HOSTED_ZONE_ID" "${{ vars.HOSTED_ZONE_ID }}"
+          require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
+          require "SA_BASE_DOMAIN" "${{ vars.SA_BASE_DOMAIN }}"
+          require "SA_ACRONYM_DEFAULT" "${{ vars.SA_ACRONYM_DEFAULT }}"
 
           echo "github.actor=${GITHUB_ACTOR}"
           echo "Resolved DEMO_OWNER=${DEMO_OWNER}"
+          echo "Resolved SA_ACRONYM=${SA_ACRONYM}"
+          echo "Resolved TLS_MODE=${TLS_MODE}"
+          echo "HOSTED_ZONE_ID=${HOSTED_ZONE_ID}"
           echo "DNS_BASE_DOMAIN=${DNS_BASE_DOMAIN}"
           echo "DNS_TTL=${DNS_TTL}"
 
@@ -118,12 +134,13 @@ jobs:
           set -euo pipefail
           set -x
 
-          TLS_MODE_INPUT="${{ inputs.TlsMode || 'Weak' }}"
+          TLS_MODE_INPUT="${TLS_MODE}"
 
           echo "STACK_NAME='${STACK_NAME}'"
           echo "AWS_REGION='${AWS_REGION}'"
           echo "TEMPLATE_FILE='${TEMPLATE_FILE}'"
           echo "DEMO_OWNER='${DEMO_OWNER}'"
+          echo "SA_ACRONYM='${SA_ACRONYM}'"
           echo "TlsMode='${TLS_MODE_INPUT}'"
           echo "ImageTag='${IMAGE_TAG}'"
 
@@ -199,16 +216,15 @@ jobs:
           echo "PUBLIC_IP=${PUBLIC_IP}"
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Update Route 53 A record (DEMO_OWNER -> Public IP)
+      - name: Update Route 53 A record (SA_ACRONYM -> Public IP)
         id: dns
         shell: bash
         env:
-          HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
           PUBLIC_IP: ${{ steps.pubip.outputs.public_ip }}
         run: |
           set -euo pipefail
 
-          DNS_NAME="${DEMO_OWNER}.${DNS_BASE_DOMAIN}"
+          DNS_NAME="${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
           echo "Updating DNS: ${DNS_NAME} -> ${PUBLIC_IP}"
 
           aws route53 change-resource-record-sets \
@@ -227,6 +243,7 @@ jobs:
             }" >/dev/null
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
+          echo "DAST_URL=https://${DNS_NAME}"
 
     outputs:
       instance_id: ${{ steps.cfnout.outputs.instance_id }}
