@@ -90,8 +90,7 @@ Resources:
           echo "=== UserData start: TLS_MODE=${TLS_MODE} ==="
 
           apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            nginx openssl ca-certificates curl docker.io
+          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates curl docker.io
 
           systemctl enable docker
           systemctl restart docker
@@ -105,66 +104,74 @@ Resources:
             -subj "/CN=${AppName}"
 
           if [ "${TLS_MODE}" = "Weak" ]; then
+            echo "Applying WEAK TLS configuration"
             cat > /etc/nginx/conf.d/app.conf <<'EOF'
-server {
-  listen 443 ssl;
-  listen [::]:443 ssl;
-  server_name _;
+              server {
+                listen 443 ssl;
+                listen [::]:443 ssl;
+                server_name _;
 
-  ssl_certificate /etc/nginx/self.crt;
-  ssl_certificate_key /etc/nginx/self.key;
+                ssl_certificate /etc/nginx/self.crt;
+                ssl_certificate_key /etc/nginx/self.key;
 
-  ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-  ssl_ciphers "HIGH:!aNULL:!MD5";
-  ssl_prefer_server_ciphers on;
+                # Intentionally weak protocols (demo)
+                ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
 
-  location = /tls-info {
-    default_type text/plain;
-    return 200 "mode=Weak\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-  }
+                # Broad cipher allowance (demo)
+                ssl_ciphers "HIGH:!aNULL:!MD5";
+                ssl_prefer_server_ciphers on;
 
-  location / {
-    proxy_pass http://127.0.0.1:5000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }
-}
+                location = /tls-info {
+                  default_type text/plain;
+                  return 200 "mode=Weak\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
+                }
+
+                location / {
+                  proxy_pass http://127.0.0.1:5000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                }
+              }
 EOF
           else
+            echo "Applying SECURE TLS configuration"
             cat > /etc/nginx/conf.d/app.conf <<'EOF'
-server {
-  listen 443 ssl;
-  listen [::]:443 ssl;
-  server_name _;
+              server {
+                listen 443 ssl;
+                listen [::]:443 ssl;
+                server_name _;
 
-  ssl_certificate /etc/nginx/self.crt;
-  ssl_certificate_key /etc/nginx/self.key;
+                ssl_certificate /etc/nginx/self.crt;
+                ssl_certificate_key /etc/nginx/self.key;
 
-  ssl_protocols TLSv1.2 TLSv1.3;
-  ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
-  ssl_prefer_server_ciphers on;
+                # Modern TLS only
+                ssl_protocols TLSv1.2 TLSv1.3;
 
-  ssl_ecdh_curve X25519:secp256r1;
-  ssl_session_cache shared:SSL:10m;
-  ssl_session_timeout 10m;
+                # Strong ciphers (AEAD + PFS only)
+                ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+                ssl_prefer_server_ciphers on;
 
-  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-  add_header X-Content-Type-Options nosniff;
-  add_header X-Frame-Options DENY;
+                ssl_ecdh_curve X25519:secp256r1;
+                ssl_session_cache shared:SSL:10m;
+                ssl_session_timeout 10m;
 
-  location = /tls-info {
-    default_type text/plain;
-    return 200 "mode=Secure\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-  }
+                add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+                add_header X-Content-Type-Options nosniff;
+                add_header X-Frame-Options DENY;
 
-  location / {
-    proxy_pass http://127.0.0.1:5000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-  }
-}
+                location = /tls-info {
+                  default_type text/plain;
+                  return 200 "mode=Secure\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
+                }
+
+                location / {
+                  proxy_pass http://127.0.0.1:5000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                }
+              }
 EOF
           fi
 
@@ -172,19 +179,17 @@ EOF
           nginx -t
           systemctl enable nginx
           systemctl restart nginx
-
           ss -lntp | egrep ':443|nginx' || true
+
           echo "=== UserData complete: TLS_MODE=${TLS_MODE} ==="
 
 Outputs:
   InstanceId:
     Description: EC2 Instance ID
     Value: !Ref ApiInstance
-
   TlsMode:
     Description: TLS posture applied at deploy time
     Value: !Ref TlsMode
-
   ImageTag:
     Description: Image tag recorded on the instance
     Value: !Ref ImageTag
