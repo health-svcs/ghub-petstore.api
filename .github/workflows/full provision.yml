@@ -32,8 +32,8 @@ env:
   # Single source of truth (per repo via APP_NAME_DEFAULT)
   APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
 
-  # Eliminate duplication: ECR repo = APP_NAME
-  ECR_REPO: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
+  # ECR repo name: must be valid (no dots). We'll sanitize later and use SANITIZED_ECR_REPO.
+  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
 
   IMAGE_TAG: ${{ github.run_id }}
   TEMPLATE_FILE: cloudformation/ec2.yaml
@@ -93,17 +93,38 @@ jobs:
       public_ip: ${{ steps.pubip.outputs.public_ip }}
       dns_name: ${{ steps.dns.outputs.dns_name }}
       dast_url: ${{ steps.dns.outputs.dast_url }}
+      ecr_repo: ${{ steps.names.outputs.ecr_repo }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set STACK_NAME
+      - name: Derive safe names (Stack + ECR)
+        id: names
         shell: bash
         run: |
           set -euo pipefail
-          echo "STACK_NAME=${APP_NAME}-ec2-${GITHUB_ACTOR}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
-          echo "STACK_NAME set to: ${APP_NAME}-ec2-${GITHUB_ACTOR}-${GITHUB_RUN_ID}"
+
+          # StackName rules: [a-zA-Z][-a-zA-Z0-9]*  (NO dots)
+          # ECR repo rules: lowercase, digits, separators, NO dots. Keep it simple.
+          RAW_APP="${APP_NAME}"
+          SAFE_STACK_APP="$(echo "${RAW_APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-' )"
+          SAFE_ACTOR="$(echo "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-' )"
+          STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
+
+          # ECR: lowercase, replace dots/underscores with hyphen, strip invalid chars.
+          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-' | sed 's#//*#/#g' | sed 's#^-##; s#-$##')"
+          # If they passed something odd and it becomes empty, fallback:
+          if [[ -z "${SAFE_ECR}" ]]; then SAFE_ECR="petstore-api"; fi
+
+          echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
+          echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
+
+          echo "stack_name=${STACK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
+
+          echo "STACK_NAME set to: ${STACK_NAME}"
+          echo "SANITIZED_ECR_REPO set to: ${SAFE_ECR}"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -138,13 +159,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Your template's logical resource id is ApiInstance
           INSTANCE_ID="$(aws cloudformation describe-stack-resources \
             --stack-name "${STACK_NAME}" \
             --region "${AWS_REGION}" \
-            --query "StackResources[?LogicalResourceId=='PetstoreInstance'].PhysicalResourceId" \
+            --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: no InstanceId"; exit 1; }
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "InstanceId=${INSTANCE_ID}"
 
       - name: Wait for instance checks
         shell: bash
@@ -164,6 +187,7 @@ jobs:
             --output text)"
           [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: no Public IP"; exit 1; }
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
+          echo "PublicIp=${PUBLIC_IP}"
 
       - name: Update Route 53 A record + Print DAST Target
         id: dns
@@ -241,6 +265,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Use sanitized ECR repo from provision job output
+          ECR_REPO="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
           echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
@@ -250,6 +276,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ECR_REPO="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
           aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
           aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null
 
@@ -297,10 +324,6 @@ jobs:
           echo "Deploying to ${INSTANCE_ID}"
           echo "IMAGE_URI=${IMAGE_URI}"
 
-          # Commands run on the EC2 instance
-          # - login to ECR
-          # - stop old container
-          # - run new container on 127.0.0.1:5000 (NGINX proxies to it)
           CMD_ID="$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
