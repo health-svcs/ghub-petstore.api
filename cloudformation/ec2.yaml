@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: Launch EC2 instance for Petstore API with deploy-time TLS posture (NGINX)
+Description: Launch EC2 instance for API with deploy-time TLS posture (NGINX)
 
 Parameters:
   AMIId:
@@ -29,19 +29,16 @@ Parameters:
     Type: String
     Description: Tag value (workflow sets to github.actor or DEMO_OWNER)
 
-  # Recommended demo tags (safe defaults; can be overridden later)
+  # App identity (can include dots, e.g. petstore.api)
   AppName:
     Type: String
-    Default: petstore-api
-    Description: App name tag for filtering/grouping
+    Default: petstore.api
+    Description: App name tag for filtering/grouping (also used in narratives)
 
   Environment:
     Type: String
     Default: QA
-    AllowedValues:
-      - Dev
-      - QA
-      - Prod
+    AllowedValues: [Dev, QA, Prod]
     Description: Environment tag (helps asset drift / exec narratives)
 
   Demo:
@@ -49,7 +46,7 @@ Parameters:
     Default: LiveDemo
     Description: Demo tag for quick filtering/cleanup
 
-  # New: record which build/run deployed this instance
+  # record which build/run deployed this instance
   ImageTag:
     Type: String
     Default: unknown
@@ -58,9 +55,7 @@ Parameters:
   TlsMode:
     Type: String
     Default: Weak
-    AllowedValues:
-      - Weak
-      - Secure
+    AllowedValues: [Weak, Secure]
     Description: TLS posture applied at deploy time
 
 Resources:
@@ -75,11 +70,9 @@ Resources:
       KeyName: !Ref KeyName
 
       Tags:
-        # Per-SA isolation key (DemoOwner=<actor>)
         - Key: !Ref DeployTagKey
           Value: !Ref DeployTagValue
 
-        # Minimal tag contract for shared VRM tenant
         - Key: App
           Value: !Ref AppName
         - Key: Environment
@@ -98,93 +91,103 @@ Resources:
           exec > >(tee -a /var/log/userdata.log | logger -t user-data -s 2>/dev/console) 2>&1
 
           TLS_MODE='${TlsMode}'
-          echo "=== UserData start: TLS_MODE=$TLS_MODE ==="
+          echo "=== UserData start: TLS_MODE=${TLS_MODE} ==="
 
           apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl
+          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates curl
+
+          # Ensure Docker exists (for SSM deploy step)
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "Installing Docker..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+            systemctl enable docker
+            systemctl restart docker
+          fi
 
           # Self-signed cert (demo only)
+          install -d /etc/nginx
           openssl req -x509 -nodes -days 365 \
             -newkey rsa:2048 \
             -keyout /etc/nginx/self.key \
             -out /etc/nginx/self.crt \
-            -subj "/CN=petstore-tls"
+            -subj "/CN=${AppName}"
 
-          if [ "$TLS_MODE" = "Weak" ]; then
+          # Write nginx vhost (weak/secure)
+          if [ "${TLS_MODE}" = "Weak" ]; then
             echo "Applying WEAK TLS configuration"
 
             cat >/etc/nginx/conf.d/petstore.conf <<'EOF'
-          server {
-              listen 0.0.0.0:443 ssl;
-              listen [::]:443 ssl;
-              server_name _;
+server {
+  listen 0.0.0.0:443 ssl;
+  listen [::]:443 ssl;
+  server_name _;
 
-              ssl_certificate /etc/nginx/self.crt;
-              ssl_certificate_key /etc/nginx/self.key;
+  ssl_certificate /etc/nginx/self.crt;
+  ssl_certificate_key /etc/nginx/self.key;
 
-              # Intentionally weak protocols (demo)
-              ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+  # Intentionally weak protocols (demo)
+  ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
 
-              # Broad cipher allowance (demo)
-              ssl_ciphers "HIGH:!aNULL:!MD5";
-              ssl_prefer_server_ciphers on;
+  # Broad cipher allowance (demo)
+  ssl_ciphers "HIGH:!aNULL:!MD5";
+  ssl_prefer_server_ciphers on;
 
-              location = /tls-info {
-                  default_type text/plain;
-                  return 200 "mode=Weak\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-              }
+  location = /tls-info {
+    default_type text/plain;
+    return 200 "mode=Weak\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
+  }
 
-              location / {
-                  proxy_pass http://127.0.0.1:5000;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-              }
-          }
-          EOF
+  location / {
+    proxy_pass http://127.0.0.1:5000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+}
+EOF
 
           else
             echo "Applying SECURE TLS configuration"
 
             cat >/etc/nginx/conf.d/petstore.conf <<'EOF'
-          server {
-              listen 0.0.0.0:443 ssl;
-              listen [::]:443 ssl;
-              server_name _;
+server {
+  listen 0.0.0.0:443 ssl;
+  listen [::]:443 ssl;
+  server_name _;
 
-              ssl_certificate /etc/nginx/self.crt;
-              ssl_certificate_key /etc/nginx/self.key;
+  ssl_certificate /etc/nginx/self.crt;
+  ssl_certificate_key /etc/nginx/self.key;
 
-              # Modern TLS only
-              ssl_protocols TLSv1.2 TLSv1.3;
+  # Modern TLS only
+  ssl_protocols TLSv1.2 TLSv1.3;
 
-              # Strong ciphers (AEAD + PFS only). MUST be a single string.
-              ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
-              ssl_prefer_server_ciphers on;
+  # Strong ciphers (AEAD + PFS only)
+  ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+  ssl_prefer_server_ciphers on;
 
-              # Strong ephemeral curves (used for ECDHE)
-              ssl_ecdh_curve X25519:secp256r1;
+  # Strong ephemeral curves
+  ssl_ecdh_curve X25519:secp256r1;
 
-              ssl_session_cache shared:SSL:10m;
-              ssl_session_timeout 10m;
+  ssl_session_cache shared:SSL:10m;
+  ssl_session_timeout 10m;
 
-              add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-              add_header X-Content-Type-Options nosniff;
-              add_header X-Frame-Options DENY;
+  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+  add_header X-Content-Type-Options nosniff;
+  add_header X-Frame-Options DENY;
 
-              location = /tls-info {
-                  default_type text/plain;
-                  return 200 "mode=Secure\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-              }
+  location = /tls-info {
+    default_type text/plain;
+    return 200 "mode=Secure\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
+  }
 
-              location / {
-                  proxy_pass http://127.0.0.1:5000;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-          }
-          EOF
+  location / {
+    proxy_pass http://127.0.0.1:5000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+EOF
           fi
 
           # Disable default site (Ubuntu)
@@ -199,7 +202,7 @@ Resources:
           echo "=== listening sockets ==="
           ss -lntp | egrep ':443|nginx' || true
 
-          echo "=== UserData complete: TLS_MODE=$TLS_MODE ==="
+          echo "=== UserData complete: TLS_MODE=${TLS_MODE} ==="
 
 Outputs:
   InstanceId:
