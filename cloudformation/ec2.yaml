@@ -21,7 +21,6 @@ Parameters:
     Type: String
     Description: EC2 key pair
 
-  # Primary required tag (set by workflow)
   DeployTagKey:
     Type: String
     Description: Tag key (workflow sets to DemoOwner)
@@ -29,28 +28,26 @@ Parameters:
     Type: String
     Description: Tag value (workflow sets to github.actor or DEMO_OWNER)
 
-  # App identity (can include dots, e.g. petstore.api)
   AppName:
     Type: String
     Default: petstore.api
-    Description: App name tag for filtering/grouping (also used in narratives)
+    Description: App name tag (may include dots)
 
   Environment:
     Type: String
     Default: QA
     AllowedValues: [Dev, QA, Prod]
-    Description: Environment tag (helps asset drift / exec narratives)
+    Description: Environment tag
 
   Demo:
     Type: String
     Default: LiveDemo
-    Description: Demo tag for quick filtering/cleanup
+    Description: Demo tag
 
-  # record which build/run deployed this instance
   ImageTag:
     Type: String
     Default: unknown
-    Description: Image tag deployed (workflow should pass github.run_id)
+    Description: Image tag deployed (github.run_id)
 
   TlsMode:
     Type: String
@@ -59,7 +56,7 @@ Parameters:
     Description: TLS posture applied at deploy time
 
 Resources:
-  PetstoreInstance:
+  ApiInstance:
     Type: AWS::EC2::Instance
     Properties:
       ImageId: !Ref AMIId
@@ -72,7 +69,6 @@ Resources:
       Tags:
         - Key: !Ref DeployTagKey
           Value: !Ref DeployTagValue
-
         - Key: App
           Value: !Ref AppName
         - Key: Environment
@@ -90,45 +86,35 @@ Resources:
           set -euo pipefail
           exec > >(tee -a /var/log/userdata.log | logger -t user-data -s 2>/dev/console) 2>&1
 
-          TLS_MODE='${TlsMode}'
+          TLS_MODE="${TlsMode}"
           echo "=== UserData start: TLS_MODE=${TLS_MODE} ==="
 
           apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates curl
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            nginx openssl ca-certificates curl docker.io
 
-          # Ensure Docker exists (for SSM deploy step)
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "Installing Docker..."
-            DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
-            systemctl enable docker
-            systemctl restart docker
-          fi
+          systemctl enable docker
+          systemctl restart docker
 
-          # Self-signed cert (demo only)
           install -d /etc/nginx
+
           openssl req -x509 -nodes -days 365 \
             -newkey rsa:2048 \
             -keyout /etc/nginx/self.key \
             -out /etc/nginx/self.crt \
             -subj "/CN=${AppName}"
 
-          # Write nginx vhost (weak/secure)
           if [ "${TLS_MODE}" = "Weak" ]; then
-            echo "Applying WEAK TLS configuration"
-
-            cat >/etc/nginx/conf.d/petstore.conf <<'EOF'
+            cat > /etc/nginx/conf.d/app.conf <<'EOF'
 server {
-  listen 0.0.0.0:443 ssl;
+  listen 443 ssl;
   listen [::]:443 ssl;
   server_name _;
 
   ssl_certificate /etc/nginx/self.crt;
   ssl_certificate_key /etc/nginx/self.key;
 
-  # Intentionally weak protocols (demo)
   ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-
-  # Broad cipher allowance (demo)
   ssl_ciphers "HIGH:!aNULL:!MD5";
   ssl_prefer_server_ciphers on;
 
@@ -144,29 +130,21 @@ server {
   }
 }
 EOF
-
           else
-            echo "Applying SECURE TLS configuration"
-
-            cat >/etc/nginx/conf.d/petstore.conf <<'EOF'
+            cat > /etc/nginx/conf.d/app.conf <<'EOF'
 server {
-  listen 0.0.0.0:443 ssl;
+  listen 443 ssl;
   listen [::]:443 ssl;
   server_name _;
 
   ssl_certificate /etc/nginx/self.crt;
   ssl_certificate_key /etc/nginx/self.key;
 
-  # Modern TLS only
   ssl_protocols TLSv1.2 TLSv1.3;
-
-  # Strong ciphers (AEAD + PFS only)
   ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
   ssl_prefer_server_ciphers on;
 
-  # Strong ephemeral curves
   ssl_ecdh_curve X25519:secp256r1;
-
   ssl_session_cache shared:SSL:10m;
   ssl_session_timeout 10m;
 
@@ -190,24 +168,18 @@ server {
 EOF
           fi
 
-          # Disable default site (Ubuntu)
           rm -f /etc/nginx/sites-enabled/default || true
-
-          echo "=== nginx -t ==="
           nginx -t
-
           systemctl enable nginx
           systemctl restart nginx
 
-          echo "=== listening sockets ==="
           ss -lntp | egrep ':443|nginx' || true
-
           echo "=== UserData complete: TLS_MODE=${TLS_MODE} ==="
 
 Outputs:
   InstanceId:
     Description: EC2 Instance ID
-    Value: !Ref PetstoreInstance
+    Value: !Ref ApiInstance
 
   TlsMode:
     Description: TLS posture applied at deploy time
