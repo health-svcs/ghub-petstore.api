@@ -67,7 +67,7 @@ Resources:
         - Key: ImageTag
           Value: !Ref ImageTag
 
-UserData:
+      UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euo pipefail
@@ -89,7 +89,7 @@ UserData:
             -out /etc/nginx/self.crt \
             -subj "/CN=${AppName}"
 
-          if [ "${TLS_MODE}" = "Weak" ]; then
+          if [ "$${TLS_MODE}" = "Weak" ]; then
             cat > /etc/nginx/conf.d/app.conf <<'NGINXCONF'
           server {
             listen 443 ssl;
@@ -135,7 +135,7 @@ UserData:
           rm -f /etc/nginx/sites-enabled/default || true
           nginx -t
           systemctl restart nginx
-      
+
 Outputs:
   InstanceId:
     Value: !Ref ApiInstance
