@@ -3,6 +3,12 @@ name: Provision EC2 + Build & Deploy petstore-api
 on:
   workflow_dispatch:
     inputs:
+      APP_NAME:
+        description: "App label for DNS/ECR (petstore-api, verademo-api, etc)"
+        required: false
+        default: "petstore-api"
+        type: string
+
       SA_ACRONYM:
         description: "3-letter SA acronym for stable DNS (agc, elg, etc)"
         required: true
@@ -25,8 +31,13 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
-  # ECR repo can be a variable; if missing, default to a sensible name
-  ECR_REPO: ${{ vars.ECR_REPO || 'petstore-api' }}
+  # App identity (single source of truth)
+  # - workflow_dispatch: inputs.APP_NAME
+  # - push: vars.APP_NAME_DEFAULT (you must create this repo var)
+  APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
+
+  # ECR repo derives from app name (eliminates duplication)
+  ECR_REPO: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
 
   # Unique image tag per workflow run (prevents collisions across SAs)
   IMAGE_TAG: ${{ github.run_id }}
@@ -38,12 +49,12 @@ env:
 
   # Per-run SA acronym:
   # - workflow_dispatch: inputs.SA_ACRONYM
-  # - push: vars.SA_ACRONYM_DEFAULT (you must create this repo var)
+  # - push: vars.SA_ACRONYM_DEFAULT
   SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
 
   # TLS mode:
   # - workflow_dispatch: inputs.TlsMode
-  # - push: vars.TLSMODE_DEFAULT (optional repo var) else Weak
+  # - push: vars.TLSMODE_DEFAULT (optional) else Weak
   TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
 
   # DNS (Route 53 for sa.livedemo-us.com)
@@ -74,7 +85,6 @@ jobs:
 
           require "AWS_ACCOUNT_ID" "${AWS_ACCOUNT_ID}"
           require "AWS_REGION" "${AWS_REGION}"
-          require "ECR_REPO" "${ECR_REPO}"
           require "AWS_ROLE_TO_ASSUME" "${{ vars.AWS_ROLE_TO_ASSUME }}"
           require "AMI_ID" "${{ vars.AMI_ID }}"
           require "INSTANCE_TYPE" "${{ vars.INSTANCE_TYPE }}"
@@ -83,6 +93,10 @@ jobs:
           require "INSTANCE_PROFILE_NAME" "${{ vars.INSTANCE_PROFILE_NAME }}"
           require "KEY_NAME" "${{ vars.KEY_NAME }}"
 
+          # App identity (required for push runs)
+          require "APP_NAME_DEFAULT" "${{ vars.APP_NAME_DEFAULT }}"
+          require "Resolved APP_NAME" "${APP_NAME}"
+
           # DNS vars (required for Route 53 updates)
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
           require "SA_BASE_DOMAIN" "${{ vars.SA_BASE_DOMAIN }}"
@@ -90,6 +104,7 @@ jobs:
 
           echo "github.actor=${GITHUB_ACTOR}"
           echo "Resolved DEMO_OWNER=${DEMO_OWNER}"
+          echo "Resolved APP_NAME=${APP_NAME}"
           echo "Resolved SA_ACRONYM=${SA_ACRONYM}"
           echo "Resolved TLS_MODE=${TLS_MODE}"
           echo "HOSTED_ZONE_ID=${HOSTED_ZONE_ID}"
@@ -116,7 +131,7 @@ jobs:
       id-token: write
       contents: read
     env:
-      STACK_NAME: petstore-ec2-${{ github.actor }}-${{ github.run_id }}
+      STACK_NAME: ${{ env.APP_NAME }}-ec2-${{ github.actor }}-${{ github.run_id }}
 
     steps:
       - name: Checkout repo
@@ -140,6 +155,7 @@ jobs:
           echo "AWS_REGION='${AWS_REGION}'"
           echo "TEMPLATE_FILE='${TEMPLATE_FILE}'"
           echo "DEMO_OWNER='${DEMO_OWNER}'"
+          echo "APP_NAME='${APP_NAME}'"
           echo "SA_ACRONYM='${SA_ACRONYM}'"
           echo "TlsMode='${TLS_MODE_INPUT}'"
           echo "ImageTag='${IMAGE_TAG}'"
@@ -158,6 +174,7 @@ jobs:
               "KeyName=${{ vars.KEY_NAME }}" \
               "DeployTagKey=DemoOwner" \
               "DeployTagValue=${DEMO_OWNER}" \
+              "AppName=${APP_NAME}" \
               "TlsMode=${TLS_MODE_INPUT}" \
               "ImageTag=${IMAGE_TAG}" \
             --no-fail-on-empty-changeset \
@@ -216,7 +233,7 @@ jobs:
           echo "PUBLIC_IP=${PUBLIC_IP}"
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Update Route 53 A record (SA_ACRONYM -> Public IP)
+      - name: Update Route 53 A record (APP_NAME + SA_ACRONYM -> Public IP)
         id: dns
         shell: bash
         env:
@@ -224,7 +241,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          DNS_NAME="${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
+          DNS_NAME="${APP_NAME}.${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
           echo "Updating DNS: ${DNS_NAME} -> ${PUBLIC_IP}"
 
           aws route53 change-resource-record-sets \
