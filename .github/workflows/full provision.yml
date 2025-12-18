@@ -29,10 +29,7 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
-  # Single source of truth (per repo via APP_NAME_DEFAULT)
   APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-
-  # ECR repo name: must be valid (no dots). We'll sanitize later and use SANITIZED_ECR_REPO.
   ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
 
   IMAGE_TAG: ${{ github.run_id }}
@@ -72,11 +69,6 @@ jobs:
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
           require "SA_BASE_DOMAIN" "${{ vars.SA_BASE_DOMAIN }}"
 
-          echo "Resolved APP_NAME=${APP_NAME}"
-          echo "Resolved SA_ACRONYM=${SA_ACRONYM}"
-          echo "Resolved TLS_MODE=${TLS_MODE}"
-          echo "Resolved DEMO_OWNER=${DEMO_OWNER}"
-
           if [[ "${DEMO_OWNER}" == "github-actions" || "${DEMO_OWNER}" == *"[bot]" ]]; then
             echo "ERROR: Refusing to provision for automation actor: ${DEMO_OWNER}"
             exit 1
@@ -99,23 +91,31 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Derive safe names (Stack + ECR)
+      - name: Derive safe names + normalize DNS parts
         id: names
         shell: bash
         run: |
           set -euo pipefail
 
-          # StackName rules: [a-zA-Z][-a-zA-Z0-9]*  (NO dots)
-          # ECR repo rules: lowercase, digits, separators, NO dots. Keep it simple.
-          RAW_APP="${APP_NAME}"
+          # Normalize/trim anything that might carry CRLF/newlines
+          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+
+          RAW_APP="$(norm "${APP_NAME}")"
+          RAW_ACR="$(norm "${SA_ACRONYM}")"
+          RAW_BASE="$(norm "${DNS_BASE_DOMAIN}")"
+
+          echo "APP_NAME_NORM=${RAW_APP}" >> "$GITHUB_ENV"
+          echo "SA_ACRONYM_NORM=${RAW_ACR}" >> "$GITHUB_ENV"
+          echo "DNS_BASE_DOMAIN_NORM=${RAW_BASE}" >> "$GITHUB_ENV"
+
+          # StackName rules: [a-zA-Z][-a-zA-Z0-9]* (NO dots)
           SAFE_STACK_APP="$(echo "${RAW_APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-' )"
-          SAFE_ACTOR="$(echo "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-' )"
+          SAFE_ACTOR="$(norm "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
 
           # ECR: lowercase, replace dots/underscores with hyphen, strip invalid chars.
-          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-' | sed 's#//*#/#g' | sed 's#^-##; s#-$##')"
-          # If they passed something odd and it becomes empty, fallback:
-          if [[ -z "${SAFE_ECR}" ]]; then SAFE_ECR="petstore-api"; fi
+          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-' | sed 's#//*#/#g' | sed 's#^-##; s#-$##')"
+          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
 
           echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
           echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
@@ -123,8 +123,9 @@ jobs:
           echo "stack_name=${STACK_NAME}" >> "$GITHUB_OUTPUT"
           echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
 
-          echo "STACK_NAME set to: ${STACK_NAME}"
-          echo "SANITIZED_ECR_REPO set to: ${SAFE_ECR}"
+          echo "STACK_NAME=${STACK_NAME}"
+          echo "ECR_REPO=${SAFE_ECR}"
+          echo "DNS parts: APP=${RAW_APP} ACR=${RAW_ACR} BASE=${RAW_BASE}"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -148,7 +149,7 @@ jobs:
               "KeyName=${{ vars.KEY_NAME }}" \
               "DeployTagKey=DemoOwner" \
               "DeployTagValue=${DEMO_OWNER}" \
-              "AppName=${APP_NAME}" \
+              "AppName=${APP_NAME_NORM}" \
               "TlsMode=${TLS_MODE}" \
               "ImageTag=${IMAGE_TAG}" \
             --no-fail-on-empty-changeset \
@@ -159,7 +160,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Your template's logical resource id is ApiInstance
           INSTANCE_ID="$(aws cloudformation describe-stack-resources \
             --stack-name "${STACK_NAME}" \
             --region "${AWS_REGION}" \
@@ -167,7 +167,6 @@ jobs:
             --output text)"
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: no InstanceId"; exit 1; }
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
-          echo "InstanceId=${INSTANCE_ID}"
 
       - name: Wait for instance checks
         shell: bash
@@ -187,7 +186,6 @@ jobs:
             --output text)"
           [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: no Public IP"; exit 1; }
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
-          echo "PublicIp=${PUBLIC_IP}"
 
       - name: Update Route 53 A record + Print DAST Target
         id: dns
@@ -197,33 +195,39 @@ jobs:
         run: |
           set -euo pipefail
 
-          DNS_NAME="${APP_NAME}.${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
+          # Normalize one more time, just in case
+          APP="$(printf "%s" "${APP_NAME_NORM}" | tr -d '\r\n' | xargs)"
+          ACR="$(printf "%s" "${SA_ACRONYM_NORM}" | tr -d '\r\n' | xargs)"
+          BASE="$(printf "%s" "${DNS_BASE_DOMAIN_NORM}" | tr -d '\r\n' | xargs)"
+
+          DNS_NAME="${APP}.${ACR}.${BASE}"
           DAST_URL="https://${DNS_NAME}"
+
+          # Build JSON safely (avoids invalid control characters)
+          CHANGE_BATCH="$(jq -n \
+            --arg comment "GitHub Actions demo DNS update" \
+            --arg name "${DNS_NAME}" \
+            --arg value "${PUBLIC_IP}" \
+            --argjson ttl "${DNS_TTL}" \
+            '{
+              Comment: $comment,
+              Changes: [{
+                Action: "UPSERT",
+                ResourceRecordSet: {
+                  Name: $name,
+                  Type: "A",
+                  TTL: $ttl,
+                  ResourceRecords: [{Value: $value}]
+                }
+              }]
+            }')"
 
           aws route53 change-resource-record-sets \
             --hosted-zone-id "${HOSTED_ZONE_ID}" \
-            --change-batch "{
-              \"Comment\": \"GitHub Actions demo DNS update\",
-              \"Changes\": [{
-                \"Action\": \"UPSERT\",
-                \"ResourceRecordSet\": {
-                  \"Name\": \"${DNS_NAME}\",
-                  \"Type\": \"A\",
-                  \"TTL\": ${DNS_TTL},
-                  \"ResourceRecords\": [{\"Value\": \"${PUBLIC_IP}\"}]
-                }
-              }]
-            }" >/dev/null
+            --change-batch "${CHANGE_BATCH}" >/dev/null
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
-
-          echo ""
-          echo "============================================================"
-          echo "  ✅ PERMANENT DAST TARGET:"
-          echo "     ${DAST_URL}"
-          echo "============================================================"
-          echo ""
 
           {
             echo "## ✅ Permanent DAST Target"
@@ -265,12 +269,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Use sanitized ECR repo from provision job output
           ECR_REPO="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
           echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "Using IMAGE_URI=${IMAGE_URI}"
 
       - name: Ensure ECR repository exists
         shell: bash
@@ -321,9 +323,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Deploying to ${INSTANCE_ID}"
-          echo "IMAGE_URI=${IMAGE_URI}"
-
           CMD_ID="$(aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
@@ -339,7 +338,6 @@ jobs:
             " \
             --query "Command.CommandId" --output text)"
 
-          echo "SSM CommandId=${CMD_ID}"
           aws ssm wait command-executed --command-id "${CMD_ID}" --instance-id "${INSTANCE_ID}"
 
           aws ssm get-command-invocation \
