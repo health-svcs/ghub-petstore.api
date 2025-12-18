@@ -111,7 +111,6 @@ jobs:
           echo "DNS_BASE_DOMAIN=${DNS_BASE_DOMAIN}"
           echo "DNS_TTL=${DNS_TTL}"
 
-          # Protect shared VRM tenant from scheduled/bot runs accidentally tagging everything as github-actions
           if [[ "${DEMO_OWNER}" == "github-actions" || "${DEMO_OWNER}" == *"[bot]" ]]; then
             echo "ERROR: Refusing to provision demo assets for automation actor: ${DEMO_OWNER}"
             echo "If intentional, set repo/org variable DEMO_OWNER to a human/team value."
@@ -130,12 +129,17 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    env:
-      STACK_NAME: ${{ env.APP_NAME }}-ec2-${{ github.actor }}-${{ github.run_id }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set STACK_NAME
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "STACK_NAME=${APP_NAME}-ec2-${GITHUB_ACTOR}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+          echo "STACK_NAME set to: ${APP_NAME}-ec2-${GITHUB_ACTOR}-${GITHUB_RUN_ID}"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
