@@ -41,7 +41,7 @@ env:
   TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
 
   HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID_SA }}
-  DNS_BASE_DOMAIN: ${{ vars.SA_BASE_DOMAIN }} # sa.livedemo-us.com
+  DNS_BASE_DOMAIN: ${{ vars.SA_BASE_DOMAIN }}
   DNS_TTL: ${{ vars.DNS_TTL || '60' }}
 
 jobs:
@@ -63,7 +63,6 @@ jobs:
           require "SG_IDS" "${{ vars.SG_IDS }}"
           require "INSTANCE_PROFILE_NAME" "${{ vars.INSTANCE_PROFILE_NAME }}"
           require "KEY_NAME" "${{ vars.KEY_NAME }}"
-
           require "APP_NAME_DEFAULT" "${{ vars.APP_NAME_DEFAULT }}"
           require "SA_ACRONYM_DEFAULT" "${{ vars.SA_ACRONYM_DEFAULT }}"
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
@@ -88,52 +87,36 @@ jobs:
       ecr_repo: ${{ steps.names.outputs.ecr_repo }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Derive safe names + normalize DNS parts
+      - name: Derive safe names
         id: names
         shell: bash
         run: |
           set -euo pipefail
-
-          # Normalize/trim anything that might carry CRLF/newlines
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
-          RAW_APP="$(norm "${APP_NAME}")"
-          RAW_ACR="$(norm "${SA_ACRONYM}")"
-          RAW_BASE="$(norm "${DNS_BASE_DOMAIN}")"
+          APP="$(norm "${APP_NAME}")"
+          ACR="$(norm "${SA_ACRONYM}")"
+          BASE="$(norm "${DNS_BASE_DOMAIN}")"
 
-          echo "APP_NAME_NORM=${RAW_APP}" >> "$GITHUB_ENV"
-          echo "SA_ACRONYM_NORM=${RAW_ACR}" >> "$GITHUB_ENV"
-          echo "DNS_BASE_DOMAIN_NORM=${RAW_BASE}" >> "$GITHUB_ENV"
-
-          # StackName rules: [a-zA-Z][-a-zA-Z0-9]* (NO dots)
-          SAFE_STACK_APP="$(echo "${RAW_APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-' )"
+          SAFE_STACK_APP="$(echo "${APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           SAFE_ACTOR="$(norm "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
 
-          # ECR: lowercase, replace dots/underscores with hyphen, strip invalid chars.
-          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-' | sed 's#//*#/#g' | sed 's#^-##; s#-$##')"
+          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
           [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
 
           echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
           echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
-
-          echo "stack_name=${STACK_NAME}" >> "$GITHUB_OUTPUT"
           echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
 
-          echo "STACK_NAME=${STACK_NAME}"
-          echo "ECR_REPO=${SAFE_ECR}"
-          echo "DNS parts: APP=${RAW_APP} ACR=${RAW_ACR} BASE=${RAW_BASE}"
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy CloudFormation stack
+      - name: Deploy CloudFormation
         shell: bash
         run: |
           set -euo pipefail
@@ -141,111 +124,59 @@ jobs:
             --stack-name "${STACK_NAME}" \
             --template-file "${TEMPLATE_FILE}" \
             --parameter-overrides \
-              "AMIId=${{ vars.AMI_ID }}" \
-              "InstanceType=${{ vars.INSTANCE_TYPE }}" \
-              "SubnetId=${{ vars.SUBNET_ID }}" \
-              "SecurityGroupIds=${{ vars.SG_IDS }}" \
-              "IamInstanceProfileName=${{ vars.INSTANCE_PROFILE_NAME }}" \
-              "KeyName=${{ vars.KEY_NAME }}" \
-              "DeployTagKey=DemoOwner" \
-              "DeployTagValue=${DEMO_OWNER}" \
-              "AppName=${APP_NAME_NORM}" \
-              "TlsMode=${TLS_MODE}" \
-              "ImageTag=${IMAGE_TAG}" \
-            --no-fail-on-empty-changeset \
-            --region "${AWS_REGION}"
+              AMIId=${{ vars.AMI_ID }} \
+              InstanceType=${{ vars.INSTANCE_TYPE }} \
+              SubnetId=${{ vars.SUBNET_ID }} \
+              SecurityGroupIds=${{ vars.SG_IDS }} \
+              IamInstanceProfileName=${{ vars.INSTANCE_PROFILE_NAME }} \
+              KeyName=${{ vars.KEY_NAME }} \
+              DeployTagKey=DemoOwner \
+              DeployTagValue=${DEMO_OWNER} \
+              AppName=${APP_NAME} \
+              TlsMode=${TLS_MODE} \
+              ImageTag=${IMAGE_TAG} \
+            --no-fail-on-empty-changeset
 
-      - name: Resolve EC2 InstanceId
+      - name: Resolve Instance ID
         id: cfnout
         shell: bash
         run: |
-          set -euo pipefail
           INSTANCE_ID="$(aws cloudformation describe-stack-resources \
             --stack-name "${STACK_NAME}" \
-            --region "${AWS_REGION}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
-          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: no InstanceId"; exit 1; }
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for instance checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws ec2 wait instance-status-ok --instance-ids "${{ steps.cfnout.outputs.instance_id }}" --region "${AWS_REGION}"
 
       - name: Resolve Public IP
         id: pubip
         shell: bash
         run: |
-          set -euo pipefail
           PUBLIC_IP="$(aws ec2 describe-instances \
             --instance-ids "${{ steps.cfnout.outputs.instance_id }}" \
-            --region "${AWS_REGION}" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)"
-          [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: no Public IP"; exit 1; }
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Update Route 53 A record + Print DAST Target
+      - name: Update DNS
         id: dns
         shell: bash
-        env:
-          PUBLIC_IP: ${{ steps.pubip.outputs.public_ip }}
         run: |
-          set -euo pipefail
-
-          # Normalize one more time, just in case
-          APP="$(printf "%s" "${APP_NAME_NORM}" | tr -d '\r\n' | xargs)"
-          ACR="$(printf "%s" "${SA_ACRONYM_NORM}" | tr -d '\r\n' | xargs)"
-          BASE="$(printf "%s" "${DNS_BASE_DOMAIN_NORM}" | tr -d '\r\n' | xargs)"
-
-          DNS_NAME="${APP}.${ACR}.${BASE}"
+          DNS_NAME="${APP_NAME}.${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
           DAST_URL="https://${DNS_NAME}"
 
-          # Build JSON safely (avoids invalid control characters)
-          CHANGE_BATCH="$(jq -n \
-            --arg comment "GitHub Actions demo DNS update" \
+          jq -n \
             --arg name "${DNS_NAME}" \
-            --arg value "${PUBLIC_IP}" \
-            --argjson ttl "${DNS_TTL}" \
-            '{
-              Comment: $comment,
-              Changes: [{
-                Action: "UPSERT",
-                ResourceRecordSet: {
-                  Name: $name,
-                  Type: "A",
-                  TTL: $ttl,
-                  ResourceRecords: [{Value: $value}]
-                }
-              }]
-            }')"
+            --arg ip "${{ steps.pubip.outputs.public_ip }}" \
+            --argjson ttl ${DNS_TTL} \
+            '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$name,Type:"A",TTL:$ttl,ResourceRecords:[{Value:$ip}]}}]}' \
+          > change.json
 
           aws route53 change-resource-record-sets \
             --hosted-zone-id "${HOSTED_ZONE_ID}" \
-            --change-batch "${CHANGE_BATCH}" >/dev/null
+            --change-batch file://change.json
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
-
-          echo "::notice title=DAST Target::${DAST_URL}"
-
-          {
-            echo "## ✅ Permanent DAST Target"
-            echo ""
-            echo "**DAST URL:** ${DAST_URL}"
-            echo ""
-            echo "**DNS A record:** \`${DNS_NAME}\` → \`${PUBLIC_IP}\`"
-            echo ""
-            echo "**TLS mode:** \`${TLS_MODE}\`"
-            echo ""
-            echo "### Quick checks"
-            echo "\`\`\`bash"
-            echo "dig ${DNS_NAME} +short"
-            echo "curl -vk ${DAST_URL}/tls-info"
-            echo "\`\`\`"
-          } >> "$GITHUB_STEP_SUMMARY"
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -257,51 +188,23 @@ jobs:
       image_uri: ${{ steps.img.outputs.image_uri }}
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Compute IMAGE_URI
+      - name: Build & Push
         id: img
         shell: bash
         run: |
-          set -euo pipefail
-          ECR_REPO="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
-          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
-          echo "IMAGE_URI=${IMAGE_URI}" >> "$GITHUB_ENV"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure ECR repository exists
-        shell: bash
-        run: |
-          set -euo pipefail
-          ECR_REPO="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
-          aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null
-
-      - name: Login to ECR
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws ecr get-login-password --region "${AWS_REGION}" | \
-            docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-      - name: Build docker image
-        shell: bash
-        run: |
-          set -euo pipefail
+          ECR="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR}:${IMAGE_TAG}"
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           docker build -t "${IMAGE_URI}" .
-
-      - name: Push docker image
-        shell: bash
-        run: |
-          set -euo pipefail
           docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
   deploy-to-ec2:
     runs-on: ubuntu-latest
@@ -311,100 +214,37 @@ jobs:
       contents: read
 
     steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Deploy container via SSM
         shell: bash
-        env:
-          INSTANCE_ID: ${{ needs.provision-ec2-cfn.outputs.instance_id }}
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
         run: |
           set -euo pipefail
 
-          echo "Deploying to ${INSTANCE_ID}"
-          echo "IMAGE_URI=${IMAGE_URI}"
+          INSTANCE_ID="${{ needs.provision-ec2-cfn.outputs.instance_id }}"
+          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
 
-          REMOTE_SCRIPT="$(cat <<'EOS'
+          cat <<'EOF' > remote.sh
           set -euo pipefail
-
-          echo "=== OS ==="
-          cat /etc/os-release || true
-
-          echo "=== Ensure Docker is installed (Ubuntu repo docker.io) ==="
-          if ! command -v docker >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
-            sudo systemctl enable --now docker
-          fi
-
-          echo "=== Docker version ==="
-          docker --version
-          sudo systemctl status docker --no-pager || true
-
-          echo "=== ECR login ==="
-          aws ecr get-login-password --region ${AWS_REGION} | \
-            docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-
-          echo "=== Pull & run ==="
-          docker pull ${IMAGE_URI}
-          docker rm -f petstore 2>/dev/null || true
-          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 ${IMAGE_URI}
-
-          echo "=== NGINX validate/restart ==="
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+          sudo systemctl enable --now docker
+          aws ecr get-login-password | docker login --username AWS --password-stdin
+          docker pull IMAGE_URI
+          docker rm -f petstore || true
+          docker run -d --name petstore -p 127.0.0.1:5000:5000 IMAGE_URI
           sudo nginx -t
           sudo systemctl restart nginx
+          EOF
 
-          echo "=== Local TLS check ==="
-          curl -sk https://127.0.0.1/tls-info || true
-          EOS
-          )"
+          sed -i "s|IMAGE_URI|${IMAGE_URI}|g" remote.sh
 
-          CMD_ID="$(aws ssm send-command \
+          B64="$(base64 -w0 remote.sh)"
+
+          aws ssm send-command \
             --instance-ids "${INSTANCE_ID}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy ${IMAGE_URI}" \
-            --parameters commands="${REMOTE_SCRIPT}" \
-            --query "Command.CommandId" --output text)"
-
-          echo "SSM CommandId=${CMD_ID}"
-
-          set +e
-          aws ssm wait command-executed --command-id "${CMD_ID}" --instance-id "${INSTANCE_ID}"
-          WAIT_RC=$?
-          set -e
-
-          INVOCATION_JSON="$(aws ssm get-command-invocation \
-            --command-id "${CMD_ID}" \
-            --instance-id "${INSTANCE_ID}" \
-            --query "{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent,ResponseCode:ResponseCode}" \
-            --output json)"
-
-          echo "=== SSM Invocation ==="
-          echo "${INVOCATION_JSON}"
-
-          STATUS="$(echo "${INVOCATION_JSON}" | jq -r '.Status')"
-          if [[ "${STATUS}" != "Success" ]]; then
-            echo "ERROR: SSM command failed (Status=${STATUS}, waiter_rc=${WAIT_RC})"
-            exit 1
-          fi
-
-      - name: Final DAST Target Summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          DAST_URL="${{ needs.provision-ec2-cfn.outputs.dast_url }}"
-          {
-            echo "## ✅ Deployment Complete"
-            echo ""
-            echo "**Permanent DAST URL:** ${DAST_URL}"
-            echo ""
-            echo "Try:"
-            echo "\`\`\`bash"
-            echo "curl -vk ${DAST_URL}/tls-info"
-            echo "curl -vk ${DAST_URL}/"
-            echo "\`\`\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            --document-name AWS-RunShellScript \
+            --parameters "{\"commands\":[\"echo ${B64} | base64 -d | bash\"]}"
