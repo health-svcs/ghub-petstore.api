@@ -4,56 +4,43 @@ Description: Launch EC2 instance for API with deploy-time TLS posture (NGINX)
 Parameters:
   AMIId:
     Type: String
-    Description: AMI ID
   InstanceType:
     Type: String
-    Description: EC2 instance type
   SubnetId:
     Type: String
-    Description: Subnet ID
   SecurityGroupIds:
     Type: CommaDelimitedList
-    Description: Security groups
   IamInstanceProfileName:
     Type: String
-    Description: IAM instance profile
   KeyName:
     Type: String
-    Description: EC2 key pair
 
   DeployTagKey:
     Type: String
-    Description: Tag key (workflow sets to DemoOwner)
   DeployTagValue:
     Type: String
-    Description: Tag value (workflow sets to github.actor or DEMO_OWNER)
 
   AppName:
     Type: String
     Default: petstore.api
-    Description: App name tag (may include dots)
 
   Environment:
     Type: String
     Default: QA
     AllowedValues: [Dev, QA, Prod]
-    Description: Environment tag
 
   Demo:
     Type: String
     Default: LiveDemo
-    Description: Demo tag
 
   ImageTag:
     Type: String
     Default: unknown
-    Description: Image tag deployed (github.run_id)
 
   TlsMode:
     Type: String
     Default: Weak
     AllowedValues: [Weak, Secure]
-    Description: TLS posture applied at deploy time
 
 Resources:
   ApiInstance:
@@ -87,15 +74,14 @@ Resources:
           exec > >(tee -a /var/log/userdata.log | logger -t user-data -s 2>/dev/console) 2>&1
 
           TLS_MODE="${TlsMode}"
-          echo "=== UserData start: TLS_MODE=${TLS_MODE} ==="
 
           apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates curl docker.io
+          DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates docker.io
 
           systemctl enable docker
           systemctl restart docker
 
-          install -d /etc/nginx
+          mkdir -p /etc/nginx/conf.d
 
           openssl req -x509 -nodes -days 365 \
             -newkey rsa:2048 \
@@ -104,92 +90,50 @@ Resources:
             -subj "/CN=${AppName}"
 
           if [ "${TLS_MODE}" = "Weak" ]; then
-            echo "Applying WEAK TLS configuration"
-            cat > /etc/nginx/conf.d/app.conf <<'EOF'
-              server {
-                listen 443 ssl;
-                listen [::]:443 ssl;
-                server_name _;
-
-                ssl_certificate /etc/nginx/self.crt;
-                ssl_certificate_key /etc/nginx/self.key;
-
-                # Intentionally weak protocols (demo)
-                ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-
-                # Broad cipher allowance (demo)
-                ssl_ciphers "HIGH:!aNULL:!MD5";
-                ssl_prefer_server_ciphers on;
-
-                location = /tls-info {
-                  default_type text/plain;
-                  return 200 "mode=Weak\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-                }
-
-                location / {
-                  proxy_pass http://127.0.0.1:5000;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                }
-              }
-EOF
+            printf '%s\n' \
+"server {" \
+"  listen 443 ssl;" \
+"  ssl_certificate /etc/nginx/self.crt;" \
+"  ssl_certificate_key /etc/nginx/self.key;" \
+"  ssl_protocols TLSv1 TLSv1.1 TLSv1.2;" \
+"  ssl_ciphers HIGH:!aNULL:!MD5;" \
+"  ssl_prefer_server_ciphers on;" \
+"  location = /tls-info {" \
+"    default_type text/plain;" \
+"    return 200 \"mode=Weak\";" \
+"  }" \
+"  location / {" \
+"    proxy_pass http://127.0.0.1:5000;" \
+"  }" \
+"}" > /etc/nginx/conf.d/app.conf
           else
-            echo "Applying SECURE TLS configuration"
-            cat > /etc/nginx/conf.d/app.conf <<'EOF'
-              server {
-                listen 443 ssl;
-                listen [::]:443 ssl;
-                server_name _;
-
-                ssl_certificate /etc/nginx/self.crt;
-                ssl_certificate_key /etc/nginx/self.key;
-
-                # Modern TLS only
-                ssl_protocols TLSv1.2 TLSv1.3;
-
-                # Strong ciphers (AEAD + PFS only)
-                ssl_ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
-                ssl_prefer_server_ciphers on;
-
-                ssl_ecdh_curve X25519:secp256r1;
-                ssl_session_cache shared:SSL:10m;
-                ssl_session_timeout 10m;
-
-                add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
-                add_header X-Content-Type-Options nosniff;
-                add_header X-Frame-Options DENY;
-
-                location = /tls-info {
-                  default_type text/plain;
-                  return 200 "mode=Secure\nprotocol=$ssl_protocol\ncipher=$ssl_cipher\n";
-                }
-
-                location / {
-                  proxy_pass http://127.0.0.1:5000;
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                }
-              }
-EOF
+            printf '%s\n' \
+"server {" \
+"  listen 443 ssl;" \
+"  ssl_certificate /etc/nginx/self.crt;" \
+"  ssl_certificate_key /etc/nginx/self.key;" \
+"  ssl_protocols TLSv1.2 TLSv1.3;" \
+"  ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;" \
+"  ssl_prefer_server_ciphers on;" \
+"  add_header Strict-Transport-Security \"max-age=63072000\" always;" \
+"  location = /tls-info {" \
+"    default_type text/plain;" \
+"    return 200 \"mode=Secure\";" \
+"  }" \
+"  location / {" \
+"    proxy_pass http://127.0.0.1:5000;" \
+"  }" \
+"}" > /etc/nginx/conf.d/app.conf
           fi
 
           rm -f /etc/nginx/sites-enabled/default || true
           nginx -t
-          systemctl enable nginx
           systemctl restart nginx
-          ss -lntp | egrep ':443|nginx' || true
-
-          echo "=== UserData complete: TLS_MODE=${TLS_MODE} ==="
 
 Outputs:
   InstanceId:
-    Description: EC2 Instance ID
     Value: !Ref ApiInstance
   TlsMode:
-    Description: TLS posture applied at deploy time
     Value: !Ref TlsMode
   ImageTag:
-    Description: Image tag recorded on the instance
     Value: !Ref ImageTag
