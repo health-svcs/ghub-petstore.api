@@ -64,11 +64,26 @@ Resources:
           Value: !Ref TlsMode
         - Key: "ImageTag"
           Value: !Ref ImageTag
+        - Key: "Name"
+          Value: !Sub "${AppName}-${AWS::StackName}"
 
 Outputs:
   InstanceId:
+    Description: "EC2 InstanceId"
     Value: !Ref ApiInstance
+
+  PublicIp:
+    Description: "EC2 Public IPv4 (for Route53 A record)"
+    Value: !GetAtt ApiInstance.PublicIp
+
+  PublicDnsName:
+    Description: "EC2 Public DNS name"
+    Value: !GetAtt ApiInstance.PublicDnsName
+
   TlsMode:
+    Description: "TLS mode label"
     Value: !Ref TlsMode
+
   ImageTag:
+    Description: "Image tag label"
     Value: !Ref ImageTag
