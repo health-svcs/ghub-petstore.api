@@ -180,8 +180,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          DNS_NAME="${APP_NAME}.${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
-          DAST_URL="https://${DNS_NAME}"
+          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+
+          # Normalize and remove unsupported characters for DNS labels
+          APP_RAW="$(norm "${APP_NAME}")"
+          ACR_RAW="$(norm "${SA_ACRONYM}")"
+          BASE_RAW="$(norm "${DNS_BASE_DOMAIN}")"
+
+          APP_DNS="$(echo "${APP_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
+          ACR_DNS="$(echo "${ACR_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' | sed 's/^-*//;s/-*$//')"
+          BASE_DNS="$(echo "${BASE_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
+
+          DNS_NAME="${APP_DNS}.${ACR_DNS}.${BASE_DNS}."
+          DAST_URL="https://${APP_DNS}.${ACR_DNS}.${BASE_DNS}"
+
+          echo "DNS_NAME=${DNS_NAME}"
+          echo "PUBLIC_IP=${{ steps.pubip.outputs.public_ip }}"
 
           jq -n \
             --arg name "${DNS_NAME}" \
