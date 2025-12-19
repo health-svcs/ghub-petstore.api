@@ -335,7 +335,8 @@ jobs:
           b64_dcfg  = base64.b64encode(docker_cfg.encode()).decode()
 
           commands = [
-            "set -euo pipefail",
+            # IMPORTANT: SSM RunShellScript is executed by /bin/sh (dash). No pipefail.
+            "set -eu",
 
             "echo '=== OS ==='; cat /etc/os-release || true",
 
