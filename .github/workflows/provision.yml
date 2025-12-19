@@ -8,21 +8,17 @@ on:
         required: false
         default: "petstore.api"
         type: string
-
       SA_ACRONYM:
         description: "3-letter SA acronym for stable DNS (agc, elg, etc)"
         required: true
         default: "agc"
         type: string
-
       TlsMode:
         description: "TLS posture applied at deploy time (NGINX): Weak or Secure"
         required: true
         default: "Weak"
         type: choice
-        options:
-          - Weak
-          - Secure
+        options: ["Weak", "Secure"]
 
   push:
     branches: ["main"]
@@ -98,7 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
@@ -145,6 +142,7 @@ jobs:
             --stack-name "${STACK_NAME}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
+
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
           echo "InstanceId: ${INSTANCE_ID}"
 
@@ -203,6 +201,7 @@ jobs:
             --change-batch file://change.json \
             --query 'ChangeInfo.Id' \
             --output text)"
+
           echo "Route53 change id: ${CHANGE_ID}"
           aws route53 wait resource-record-sets-changed --id "${CHANGE_ID}"
 
@@ -224,7 +223,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
@@ -262,12 +262,13 @@ jobs:
       contents: read
 
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (sh-safe: no pipefail) and always print logs
+      - name: Deploy via SSM (sh-safe) and always print logs
         shell: bash
         run: |
           set -euo pipefail
@@ -276,10 +277,7 @@ jobs:
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           TLS_MODE="${TLS_MODE}"
 
-          export INSTANCE_ID
-          export IMAGE_URI
-          export TLS_MODE
-
+          export INSTANCE_ID IMAGE_URI TLS_MODE
           echo "INSTANCE_ID=${INSTANCE_ID}"
           echo "IMAGE_URI=${IMAGE_URI}"
           echo "TLS_MODE=${TLS_MODE}"
@@ -306,7 +304,6 @@ jobs:
           """
               mode_text = "Weak"
 
-          # POSIX sh script (no pipefail)
           script = f"""#!/bin/sh
           set -eu
 
@@ -322,7 +319,7 @@ jobs:
           sudo systemctl enable --now nginx
 
           echo "=== Cert ==="
-          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
             -keyout /etc/nginx/self.key -out /etc/nginx/self.crt -subj "/CN=localhost" || true
 
           echo "=== NGINX config ==="
@@ -377,17 +374,15 @@ jobs:
           print("Wrote ssm-params.json")
           PY
 
-          COMMAND_ID="$(
-            aws ssm send-command \
-              --instance-ids "${INSTANCE_ID}" \
-              --document-name "AWS-RunShellScript" \
-              --parameters file://ssm-params.json \
-              --query "Command.CommandId" \
-              --output text
-          )"
+          COMMAND_ID="$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)"
+
           echo "SSM CommandId: ${COMMAND_ID}"
 
-          # Poll for up to ~5 minutes (60 * 5s)
           STATUS="Unknown"
           for i in {1..60}; do
             STATUS="$(aws ssm get-command-invocation \
