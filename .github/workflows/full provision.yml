@@ -8,19 +8,19 @@ on:
         required: false
         default: "petstore.api"
         type: string
-
       SA_ACRONYM:
         description: "3-letter SA acronym for stable DNS (agc, elg, etc)"
         required: true
         default: "agc"
         type: string
-
       TlsMode:
         description: "TLS posture applied at deploy time (NGINX): Weak or Secure"
         required: true
         default: "Weak"
         type: choice
-        options: [Weak, Secure]
+        options:
+          - Weak
+          - Secure
 
   push:
     branches: ["main"]
@@ -30,25 +30,24 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
 
   APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-
-  IMAGE_TAG: ${{ github.run_id }}
-  TEMPLATE_FILE: cloudformation/ec2.yaml
-
-  DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
-
   SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
   TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
 
+  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
+  IMAGE_TAG: ${{ github.run_id }}
+
+  TEMPLATE_FILE: cloudformation/ec2.yaml
   HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID_SA }}
   DNS_BASE_DOMAIN: ${{ vars.SA_BASE_DOMAIN }}
   DNS_TTL: ${{ vars.DNS_TTL || '60' }}
+
+  DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
 
 jobs:
   validate-inputs:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate required repo/org variables
+      - name: Validate required variables
         shell: bash
         run: |
           set -euo pipefail
@@ -57,12 +56,14 @@ jobs:
           require "AWS_ACCOUNT_ID" "${AWS_ACCOUNT_ID}"
           require "AWS_REGION" "${AWS_REGION}"
           require "AWS_ROLE_TO_ASSUME" "${{ vars.AWS_ROLE_TO_ASSUME }}"
+
           require "AMI_ID" "${{ vars.AMI_ID }}"
           require "INSTANCE_TYPE" "${{ vars.INSTANCE_TYPE }}"
           require "SUBNET_ID" "${{ vars.SUBNET_ID }}"
           require "SG_IDS" "${{ vars.SG_IDS }}"
           require "INSTANCE_PROFILE_NAME" "${{ vars.INSTANCE_PROFILE_NAME }}"
           require "KEY_NAME" "${{ vars.KEY_NAME }}"
+
           require "APP_NAME_DEFAULT" "${{ vars.APP_NAME_DEFAULT }}"
           require "SA_ACRONYM_DEFAULT" "${{ vars.SA_ACRONYM_DEFAULT }}"
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
@@ -78,49 +79,47 @@ jobs:
             exit 1
           fi
 
-  provision-ec2-cfn:
+  provision:
     runs-on: ubuntu-latest
     needs: validate-inputs
     permissions:
       id-token: write
       contents: read
     outputs:
-      instance_id: ${{ steps.cfnout.outputs.instance_id }}
-      public_ip: ${{ steps.pubip.outputs.public_ip }}
-      dns_name: ${{ steps.dns.outputs.dns_name }}
-      dast_url: ${{ steps.dns.outputs.dast_url }}
-      ecr_repo: ${{ steps.names.outputs.ecr_repo }}
+      instance_id: ${{ steps.out.outputs.instance_id }}
+      public_ip: ${{ steps.out.outputs.public_ip }}
+      dns_name: ${{ steps.out.outputs.dns_name }}
+      dast_url: ${{ steps.out.outputs.dast_url }}
+      ecr_repo: ${{ steps.out.outputs.ecr_repo }}
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Derive safe names
-        id: names
-        shell: bash
-        run: |
-          set -euo pipefail
-          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
-
-          APP="$(norm "${APP_NAME}")"
-          SAFE_STACK_APP="$(echo "${APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
-          SAFE_ACTOR="$(norm "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
-          STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
-
-          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
-          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
-
-          echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
-          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy CloudFormation
+      - name: Derive names + deploy CFN + wait + DNS
+        id: out
         shell: bash
         run: |
           set -euo pipefail
+
+          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+
+          APP="$(norm "${APP_NAME}")"
+          ACR="$(norm "${SA_ACRONYM}")"
+          BASE="$(norm "${DNS_BASE_DOMAIN}")"
+
+          SAFE_STACK_APP="$(echo "${APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
+          SAFE_ACTOR="$(echo "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
+          STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
+
+          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
+          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
+
+          echo "Deploying stack: ${STACK_NAME}"
           aws cloudformation deploy \
             --stack-name "${STACK_NAME}" \
             --template-file "${TEMPLATE_FILE}" \
@@ -139,81 +138,47 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
 
-      - name: Resolve Instance ID
-        id: cfnout
-        shell: bash
-        run: |
-          set -euo pipefail
           INSTANCE_ID="$(aws cloudformation describe-stack-resources \
             --stack-name "${STACK_NAME}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
-          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "InstanceId: ${INSTANCE_ID}"
 
-      - name: Wait for EC2 + SSM readiness
-        shell: bash
-        run: |
-          set -euo pipefail
-          INSTANCE_ID="${{ steps.cfnout.outputs.instance_id }}"
-
-          echo "Waiting for EC2 running..."
           aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
-
-          echo "Waiting for EC2 status checks ok..."
           aws ec2 wait instance-status-ok --instance-ids "${INSTANCE_ID}"
 
-          echo "Waiting for SSM Online..."
+          # Wait for SSM Online
           for i in {1..90}; do
             STATUS="$(aws ssm describe-instance-information \
               --filters Key=InstanceIds,Values="${INSTANCE_ID}" \
               --query "InstanceInformationList[0].PingStatus" \
               --output text || true)"
-            echo "SSM PingStatus: ${STATUS}"
-            if [[ "${STATUS}" == "Online" ]]; then
-              exit 0
-            fi
+            echo "SSM: ${STATUS}"
+            [[ "${STATUS}" == "Online" ]] && break
             sleep 10
           done
+          [[ "${STATUS}" == "Online" ]] || { echo "ERROR: SSM not Online"; exit 1; }
 
-          echo "ERROR: SSM agent did not come Online in time"
-          exit 1
-
-      - name: Resolve Public IP
-        id: pubip
-        shell: bash
-        run: |
-          set -euo pipefail
           PUBLIC_IP="$(aws ec2 describe-instances \
-            --instance-ids "${{ steps.cfnout.outputs.instance_id }}" \
+            --instance-ids "${INSTANCE_ID}" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)"
-          [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: Instance has no Public IP"; exit 1; }
-          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
+          [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: No public IP"; exit 1; }
+          echo "PublicIP: ${PUBLIC_IP}"
 
-      - name: Update DNS (Route53 A record)
-        id: dns
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
-
-          APP_RAW="$(norm "${APP_NAME}")"
-          ACR_RAW="$(norm "${SA_ACRONYM}")"
-          BASE_RAW="$(norm "${DNS_BASE_DOMAIN}")"
-
-          APP_DNS="$(echo "${APP_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
-          ACR_DNS="$(echo "${ACR_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' | sed 's/^-*//;s/-*$//')"
-          BASE_DNS="$(echo "${BASE_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
+          # DNS-safe pieces
+          APP_DNS="$(echo "${APP}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
+          ACR_DNS="$(echo "${ACR}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-'  | sed 's/^-*//;s/-*$//')"
+          BASE_DNS="$(echo "${BASE}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
 
           DNS_NAME="${APP_DNS}.${ACR_DNS}.${BASE_DNS}"
           DAST_URL="https://${DNS_NAME}"
 
           jq -n \
             --arg name "${DNS_NAME}." \
-            --arg ip "${{ steps.pubip.outputs.public_ip }}" \
-            --argjson ttl ${DNS_TTL} \
+            --arg ip "${PUBLIC_IP}" \
+            --argjson ttl "${DNS_TTL}" \
             '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$name,Type:"A",TTL:$ttl,ResourceRecords:[{Value:$ip}]}}]}' \
           > change.json
 
@@ -221,20 +186,15 @@ jobs:
             --hosted-zone-id "${HOSTED_ZONE_ID}" \
             --change-batch file://change.json
 
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Summary
-        shell: bash
-        run: |
-          echo "Instance: ${{ steps.cfnout.outputs.instance_id }}"
-          echo "Public IP: ${{ steps.pubip.outputs.public_ip }}"
-          echo "DNS: ${{ steps.dns.outputs.dns_name }}"
-          echo "DAST URL: ${{ steps.dns.outputs.dast_url }}"
+          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     runs-on: ubuntu-latest
-    needs: provision-ec2-cfn
+    needs: provision
     permissions:
       id-token: write
       contents: read
@@ -253,17 +213,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ECR="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
+          ECR="${{ needs.provision.outputs.ecr_repo }}"
           aws ecr describe-repositories --repository-names "${ECR}" >/dev/null 2>&1 || \
             aws ecr create-repository --repository-name "${ECR}" >/dev/null
 
-      - name: Build & Push (ECR)
+      - name: Build & Push
         id: img
         shell: bash
         run: |
           set -euo pipefail
-
-          ECR="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
+          ECR="${{ needs.provision.outputs.ecr_repo }}"
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           IMAGE_URI="${REGISTRY}/${ECR}:${IMAGE_TAG}"
 
@@ -275,9 +234,9 @@ jobs:
 
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
-  deploy-to-ec2:
+  deploy:
     runs-on: ubuntu-latest
-    needs: [provision-ec2-cfn, build-and-push]
+    needs: [provision, build-and-push]
     permissions:
       id-token: write
       contents: read
@@ -288,41 +247,35 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (waits + shows logs)
+      - name: Configure nginx + run container via SSM (and wait for completion)
         shell: bash
         run: |
           set -euo pipefail
 
-          INSTANCE_ID="${{ needs.provision-ec2-cfn.outputs.instance_id }}"
+          INSTANCE_ID="${{ needs.provision.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          TLS_MODE="${{ env.TLS_MODE }}"
+          TLS_MODE="${TLS_MODE}"
 
-          cat > remote.sh <<'EOF'
-          bash -lc '
-          set -euo pipefail
+          # Build one bash script payload (no nested heredocs in YAML)
+          REMOTE_SCRIPT="$(cat <<'BASH'
+bash -lc '
+set -euo pipefail
 
-          echo "=== OS ==="
-          cat /etc/os-release || true
+sudo apt-get update -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io nginx openssl ca-certificates awscli curl jq
 
-          echo "=== Install deps (nginx + docker + awscli) ==="
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io nginx openssl ca-certificates awscli curl jq
+sudo systemctl enable --now docker
+sudo systemctl enable --now nginx
 
-          echo "=== Enable services ==="
-          sudo systemctl enable --now docker
-          sudo systemctl enable --now nginx
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/nginx/self.key -out /etc/nginx/self.crt \
+  -subj "/CN=localhost"
 
-          echo "=== Create cert ==="
-          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout /etc/nginx/self.key -out /etc/nginx/self.crt \
-            -subj "/CN=localhost"
+sudo mkdir -p /etc/nginx/conf.d
 
-          echo "=== Write nginx config (${TLS_MODE}) ==="
-          sudo mkdir -p /etc/nginx/conf.d
-
-          if [ "${TLS_MODE}" = "Weak" ]; then
-            sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<NGINX
+if [ "TLS_MODE_VALUE" = "Weak" ]; then
+  sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<EOF
 server {
   listen 443 ssl;
   ssl_certificate     /etc/nginx/self.crt;
@@ -334,9 +287,9 @@ server {
   location = /tls-info { default_type text/plain; return 200 "mode=Weak"; }
   location / { proxy_pass http://127.0.0.1:5000; }
 }
-NGINX
-          else
-            sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<NGINX
+EOF
+else
+  sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<EOF
 server {
   listen 443 ssl;
   ssl_certificate     /etc/nginx/self.crt;
@@ -349,50 +302,42 @@ server {
   location = /tls-info { default_type text/plain; return 200 "mode=Secure"; }
   location / { proxy_pass http://127.0.0.1:5000; }
 }
-NGINX
-          fi
-
-          sudo rm -f /etc/nginx/sites-enabled/default || true
-          sudo nginx -t
-          sudo systemctl restart nginx
-
-          echo "=== ECR login ==="
-          aws ecr get-login-password --region AWS_REGION | \
-            docker login --username AWS --password-stdin REGISTRY
-
-          echo "=== Pull & run container (host 127.0.0.1:5000) ==="
-          docker pull IMAGE_URI
-          docker rm -f petstore || true
-          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 IMAGE_URI || true
-
-          echo "=== Local app check ==="
-          curl -sS -o /dev/null -w "http://127.0.0.1:5000/ => HTTP %{http_code}\n" http://127.0.0.1:5000/ || true
-
-          echo "=== Listeners ==="
-          sudo ss -lntp | egrep ":(443|5000)\b" || true
-
-          echo "=== NGINX error log tail ==="
-          sudo tail -n 80 /var/log/nginx/error.log || true
-
-          echo "=== petstore logs tail ==="
-          docker logs --tail 120 petstore || true
-          '
 EOF
+fi
 
-          # substitute placeholders safely
-          sed -i "s|IMAGE_URI|${IMAGE_URI}|g" remote.sh
-          sed -i "s|REGISTRY|${REGISTRY}|g" remote.sh
-          sed -i "s|AWS_REGION|${AWS_REGION}|g" remote.sh
-          sed -i "s|\\\${TLS_MODE}|${TLS_MODE}|g" remote.sh
+sudo rm -f /etc/nginx/sites-enabled/default || true
+sudo nginx -t
+sudo systemctl restart nginx
 
-          B64="$(base64 -w0 remote.sh)"
-          PARAMS="$(jq -nc --arg cmd "echo ${B64} | base64 -d | bash" '{commands:[$cmd]}')"
+aws ecr get-login-password --region AWS_REGION_VALUE | \
+  docker login --username AWS --password-stdin REGISTRY_VALUE
+
+docker pull IMAGE_URI_VALUE
+docker rm -f petstore || true
+docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 IMAGE_URI_VALUE || true
+
+echo "Local check:"
+curl -sS -o /dev/null -w "http://127.0.0.1:5000/ => HTTP %{http_code}\n" http://127.0.0.1:5000/ || true
+
+sudo ss -lntp | egrep ":(443|5000)\b" || true
+sudo tail -n 60 /var/log/nginx/error.log || true
+docker logs --tail 120 petstore || true
+'
+BASH
+)"
+
+          # Replace placeholders (simple, safe)
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//TLS_MODE_VALUE/${TLS_MODE}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//AWS_REGION_VALUE/${AWS_REGION}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//REGISTRY_VALUE/${REGISTRY}}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//IMAGE_URI_VALUE/${IMAGE_URI}}"
+
+          PARAMS="$(jq -nc --arg cmd "${REMOTE_SCRIPT}" '{commands:[$cmd]}')"
 
           COMMAND_ID="$(
             aws ssm send-command \
               --instance-ids "${INSTANCE_ID}" \
               --document-name "AWS-RunShellScript" \
-              --comment "Deploy ${IMAGE_URI}" \
               --parameters "${PARAMS}" \
               --query "Command.CommandId" \
               --output text
@@ -400,7 +345,7 @@ EOF
 
           echo "SSM CommandId: ${COMMAND_ID}"
 
-          for i in {1..90}; do
+          for i in {1..120}; do
             STATUS="$(aws ssm get-command-invocation \
               --command-id "${COMMAND_ID}" \
               --instance-id "${INSTANCE_ID}" \
@@ -430,5 +375,5 @@ EOF
       - name: Print endpoint
         shell: bash
         run: |
-          echo "DAST URL: ${{ needs.provision-ec2-cfn.outputs.dast_url }}"
-          echo "TLS probe: ${{ needs.provision-ec2-cfn.outputs.dast_url }}/tls-info"
+          echo "DAST URL: ${{ needs.provision.outputs.dast_url }}"
+          echo "Test:     ${{ needs.provision.outputs.dast_url }}/tls-info"
