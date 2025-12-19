@@ -197,7 +197,7 @@ jobs:
               }
             }]
           }
-          with open("change.json","w") as f:
+          with open("change.json", "w") as f:
             json.dump(payload, f)
           print("Wrote change.json")
           PY
@@ -273,7 +273,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (defensive docker cleanup + ECR helper) and always print logs
+      - name: Deploy via SSM (defensive cleanup; ECR helper; nginx) and print logs
         shell: bash
         run: |
           set -euo pipefail
@@ -291,24 +291,24 @@ jobs:
           tls = os.environ.get("TLS_MODE", "Weak").strip()
 
           if tls.lower() == "secure":
-              ssl_block = r"""
-            ssl_protocols TLSv1.2 TLSv1.3;
-            ssl_prefer_server_ciphers on;
-            ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-            add_header Strict-Transport-Security "max-age=63072000" always;
-          """
+              nginx_tls = "\n".join([
+                  "  ssl_protocols TLSv1.2 TLSv1.3;",
+                  "  ssl_prefer_server_ciphers on;",
+                  "  ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;",
+                  "  add_header Strict-Transport-Security \"max-age=63072000\" always;",
+              ])
               mode_text = "Secure"
           else:
-              ssl_block = r"""
-            ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-            ssl_prefer_server_ciphers on;
-            ssl_ciphers HIGH:!aNULL:!MD5;
-          """
+              nginx_tls = "\n".join([
+                  "  ssl_protocols TLSv1 TLSv1.1 TLSv1.2;",
+                  "  ssl_prefer_server_ciphers on;",
+                  "  ssl_ciphers HIGH:!aNULL:!MD5;",
+              ])
               mode_text = "Weak"
 
-          # No bashisms here: /bin/sh safe (no pipefail)
-          script = f"""#!/bin/sh
-          set -eu
+          # Use bash on the instance (pipefail-safe) and avoid *any* heredoc terminators in the workflow YAML.
+          script = f"""#!/usr/bin/env bash
+          set -euo pipefail
 
           echo "=== OS ==="
           cat /etc/os-release || true
@@ -327,25 +327,22 @@ jobs:
           sudo systemctl enable --now docker
           sudo systemctl enable --now nginx
 
-          echo "=== Configure Docker to use ECR credential helper ==="
-          sudo mkdir -p /root/.docker
-          sudo sh -c 'cat > /root/.docker/config.json' <<'DOCKERCFG'
-          {{
-            "credsStore": "ecr-login"
-          }}
-DOCKERCFG
+          echo "=== Docker: use ECR credential helper (no awscli needed) ==="
+          sudo install -d -m 700 /root/.docker
+          echo '{{"credsStore":"ecr-login"}}' | sudo tee /root/.docker/config.json >/dev/null
 
           echo "=== Cert ==="
           sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
             -keyout /etc/nginx/self.key -out /etc/nginx/self.crt -subj "/CN=localhost" || true
 
-          echo "=== NGINX config ==="
-          sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<'NGINX'
+          echo "=== Write NGINX config ==="
+          sudo install -d /etc/nginx/conf.d
+          sudo bash -lc 'cat > /etc/nginx/conf.d/app.conf' <<'EOF'
           server {{
             listen 443 ssl;
             ssl_certificate     /etc/nginx/self.crt;
             ssl_certificate_key /etc/nginx/self.key;
-          {ssl_block}
+          {nginx_tls}
             location = /tls-info {{
               default_type text/plain;
               return 200 "mode={mode_text}\\n";
@@ -354,19 +351,19 @@ DOCKERCFG
               proxy_pass http://127.0.0.1:5000;
             }}
           }}
-NGINX
+          EOF
 
           sudo rm -f /etc/nginx/sites-enabled/default || true
           sudo nginx -t
           sudo systemctl restart nginx
 
-          echo "=== Pull & run container (private ECR via instance role + helper) ==="
+          echo "=== Pull & run container ==="
           sudo docker pull "{image}"
           sudo docker rm -f petstore || true
           sudo docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 "{image}" || true
 
           echo "=== Diagnostics ==="
-          echo "listeners:"; sudo ss -lntp | egrep '(:443|:5000)' || true
+          echo "listeners:"; sudo ss -lntp | egrep "(:443|:5000)" || true
           echo "nginx err:"; sudo tail -n 120 /var/log/nginx/error.log || true
           echo "petstore logs:"; sudo docker logs --tail 200 petstore || true
           echo "DONE"
