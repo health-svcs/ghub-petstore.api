@@ -112,7 +112,7 @@ Resources:
           echo "=== Write nginx config (${TlsMode}) ==="
           mkdir -p /etc/nginx/conf.d
 
-          if [ "${TLS_MODE}" = "Weak" ]; then
+          if [ "$TLS_MODE" = "Weak" ]; then
             cat > /etc/nginx/conf.d/app.conf <<'NGINXCONF'
           server {
             listen 443 ssl;
