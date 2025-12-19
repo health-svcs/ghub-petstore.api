@@ -32,6 +32,7 @@ Parameters:
     Type: String
     Default: "petstore.api"
     Description: "App label for tagging/DNS"
+
   ImageTag:
     Type: String
     Default: "unknown"
@@ -113,7 +114,7 @@ Resources:
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             }
           }
-NGINXCONF
+            NGINXCONF
           else
             cat > /etc/nginx/conf.d/app.conf <<'NGINXCONF'
           server {
@@ -140,7 +141,7 @@ NGINXCONF
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             }
           }
-NGINXCONF
+            NGINXCONF
           fi
 
           rm -f /etc/nginx/sites-enabled/default || true
