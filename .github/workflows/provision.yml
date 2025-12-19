@@ -124,9 +124,12 @@ jobs:
           ACR="$(norm "${SA_ACRONYM}")"
           BASE="$(norm "${DNS_BASE_DOMAIN}")"
 
-          SAFE_STACK_APP="$(echo "${APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
-          SAFE_ACTOR="$(echo "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
-          STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
+          # Stack name: include ORG + REPO (repo already includes SA acronym), omit actor/app redundancy
+          ORG_NAME="${GITHUB_REPOSITORY%%/*}"     # e.g. health-svcs
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"    # e.g. agc-petstore.api
+          SAFE_ORG="$(echo "${ORG_NAME}"  | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
+          SAFE_REPO="$(echo "${REPO_NAME}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
+          STACK_NAME="${SAFE_ORG}-${SAFE_REPO}-ec2-${GITHUB_RUN_ID}"
 
           SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
           [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
@@ -437,7 +440,7 @@ jobs:
             --output text || true
 
           test "${STATUS}" = "Success"
-     
+
       - name: Print endpoint + write summary
         shell: bash
         run: |
@@ -457,21 +460,22 @@ jobs:
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           ECR_REPO="${{ needs.provision-ec2.outputs.ecr_repo }}"
 
-          # From build-and-push outputs (available because this step is in deploy job which needs build-and-push)
+          # From build-and-push outputs (available because this job needs build-and-push)
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
 
-          # Keep normal log output (handy when summary is collapsed)
+          # Keep normal log output
           echo "DAST URL:    ${DAST_URL}"
           echo "TLS Test:    ${DAST_URL}/tls-info"
           echo "DNS Name:    ${DNS_NAME}"
           echo "Public IP:   ${PUBLIC_IP}"
           echo "Instance ID: ${INSTANCE_ID}"
+          echo "ECR Repo:    ${ECR_REPO}"
           echo "Image URI:   ${IMAGE_URI}"
           echo "DEBUG_LOGS:  ${DEBUG_LOGS}"
 
-          # GitHub Actions Summary (what you actually want)
+          # GitHub Actions Summary
           {
-            echo "## 🚀 Deployment Summary"
+            echo "## Deployment Summary"
             echo ""
             echo "- **App:** ${APP_NAME:-unknown}"
             echo "- **SA Acronym:** ${SA_ACRONYM:-unknown}"
