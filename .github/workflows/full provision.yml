@@ -110,8 +110,6 @@ jobs:
           [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
 
           echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
-          echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
-
           echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
@@ -123,7 +121,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           aws cloudformation deploy \
             --stack-name "${STACK_NAME}" \
             --template-file "${TEMPLATE_FILE}" \
@@ -154,6 +151,34 @@ jobs:
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for EC2 + SSM readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ steps.cfnout.outputs.instance_id }}"
+
+          echo "Waiting for EC2 running..."
+          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+
+          echo "Waiting for EC2 status checks ok..."
+          aws ec2 wait instance-status-ok --instance-ids "${INSTANCE_ID}"
+
+          echo "Waiting for SSM Online..."
+          for i in {1..90}; do
+            STATUS="$(aws ssm describe-instance-information \
+              --filters Key=InstanceIds,Values="${INSTANCE_ID}" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text || true)"
+            echo "SSM PingStatus: ${STATUS}"
+            if [[ "${STATUS}" == "Online" ]]; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "ERROR: SSM agent did not come Online in time"
+          exit 1
+
       - name: Resolve Public IP
         id: pubip
         shell: bash
@@ -183,11 +208,10 @@ jobs:
           BASE_DNS="$(echo "${BASE_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
 
           DNS_NAME="${APP_DNS}.${ACR_DNS}.${BASE_DNS}"
-          DNS_NAME_DOT="${DNS_NAME}."
           DAST_URL="https://${DNS_NAME}"
 
           jq -n \
-            --arg name "${DNS_NAME_DOT}" \
+            --arg name "${DNS_NAME}." \
             --arg ip "${{ steps.pubip.outputs.public_ip }}" \
             --argjson ttl ${DNS_TTL} \
             '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$name,Type:"A",TTL:$ttl,ResourceRecords:[{Value:$ip}]}}]}' \
@@ -199,6 +223,14 @@ jobs:
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Instance: ${{ steps.cfnout.outputs.instance_id }}"
+          echo "Public IP: ${{ steps.pubip.outputs.public_ip }}"
+          echo "DNS: ${{ steps.dns.outputs.dns_name }}"
+          echo "DAST URL: ${{ steps.dns.outputs.dast_url }}"
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -256,7 +288,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (auto-detect container port + diagnostics)
+      - name: Deploy via SSM (waits + shows logs)
         shell: bash
         run: |
           set -euo pipefail
@@ -264,63 +296,94 @@ jobs:
           INSTANCE_ID="${{ needs.provision-ec2-cfn.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TLS_MODE="${{ env.TLS_MODE }}"
 
           cat > remote.sh <<'EOF'
+          bash -lc '
           set -euo pipefail
 
           echo "=== OS ==="
           cat /etc/os-release || true
 
-          echo "=== Ensure tools ==="
+          echo "=== Install deps (nginx + docker + awscli) ==="
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli curl jq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io nginx openssl ca-certificates awscli curl jq
 
-          echo "=== Docker service ==="
+          echo "=== Enable services ==="
           sudo systemctl enable --now docker
-          docker --version
-          sudo systemctl status docker --no-pager || true
+          sudo systemctl enable --now nginx
+
+          echo "=== Create cert ==="
+          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/nginx/self.key -out /etc/nginx/self.crt \
+            -subj "/CN=localhost"
+
+          echo "=== Write nginx config (${TLS_MODE}) ==="
+          sudo mkdir -p /etc/nginx/conf.d
+
+          if [ "${TLS_MODE}" = "Weak" ]; then
+            sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<NGINX
+server {
+  listen 443 ssl;
+  ssl_certificate     /etc/nginx/self.crt;
+  ssl_certificate_key /etc/nginx/self.key;
+  ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+  ssl_ciphers HIGH:!aNULL:!MD5;
+  ssl_prefer_server_ciphers on;
+
+  location = /tls-info { default_type text/plain; return 200 "mode=Weak"; }
+  location / { proxy_pass http://127.0.0.1:5000; }
+}
+NGINX
+          else
+            sudo tee /etc/nginx/conf.d/app.conf >/dev/null <<NGINX
+server {
+  listen 443 ssl;
+  ssl_certificate     /etc/nginx/self.crt;
+  ssl_certificate_key /etc/nginx/self.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+  ssl_prefer_server_ciphers on;
+  add_header Strict-Transport-Security "max-age=63072000" always;
+
+  location = /tls-info { default_type text/plain; return 200 "mode=Secure"; }
+  location / { proxy_pass http://127.0.0.1:5000; }
+}
+NGINX
+          fi
+
+          sudo rm -f /etc/nginx/sites-enabled/default || true
+          sudo nginx -t
+          sudo systemctl restart nginx
 
           echo "=== ECR login ==="
           aws ecr get-login-password --region AWS_REGION | \
             docker login --username AWS --password-stdin REGISTRY
 
-          echo "=== Pull image ==="
+          echo "=== Pull & run container (host 127.0.0.1:5000) ==="
           docker pull IMAGE_URI
-
-          echo "=== Detect exposed container port (fallback 5000) ==="
-          EXPOSED="$(docker image inspect IMAGE_URI --format '{{json .Config.ExposedPorts}}' || true)"
-          PORT="$(echo "$EXPOSED" | jq -r 'keys[0] // empty' | sed 's#/tcp##' || true)"
-          if [[ -z "$PORT" ]]; then PORT="5000"; fi
-          echo "Detected container port: $PORT"
-
-          echo "=== Run container: host 127.0.0.1:5000 -> container:$PORT ==="
           docker rm -f petstore || true
-          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:"$PORT" IMAGE_URI
+          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 IMAGE_URI || true
 
-          echo "=== Containers ==="
-          docker ps -a || true
-
-          echo "=== petstore logs (tail) ==="
-          docker logs --tail 200 petstore || true
-
-          echo "=== Listening ports (host) ==="
-          sudo ss -lntp | grep -E '(:443|:5000)' || true
-
-          echo "=== Local upstream test ==="
+          echo "=== Local app check ==="
           curl -sS -o /dev/null -w "http://127.0.0.1:5000/ => HTTP %{http_code}\n" http://127.0.0.1:5000/ || true
 
-          echo "=== NGINX validate + restart ==="
-          sudo nginx -t || true
-          sudo systemctl restart nginx || true
-          sudo systemctl status nginx --no-pager || true
+          echo "=== Listeners ==="
+          sudo ss -lntp | egrep ":(443|5000)\b" || true
 
-          echo "=== NGINX error log (tail) ==="
+          echo "=== NGINX error log tail ==="
           sudo tail -n 80 /var/log/nginx/error.log || true
-          EOF
 
+          echo "=== petstore logs tail ==="
+          docker logs --tail 120 petstore || true
+          '
+EOF
+
+          # substitute placeholders safely
           sed -i "s|IMAGE_URI|${IMAGE_URI}|g" remote.sh
           sed -i "s|REGISTRY|${REGISTRY}|g" remote.sh
           sed -i "s|AWS_REGION|${AWS_REGION}|g" remote.sh
+          sed -i "s|\\\${TLS_MODE}|${TLS_MODE}|g" remote.sh
 
           B64="$(base64 -w0 remote.sh)"
           PARAMS="$(jq -nc --arg cmd "echo ${B64} | base64 -d | bash" '{commands:[$cmd]}')"
@@ -337,7 +400,7 @@ jobs:
 
           echo "SSM CommandId: ${COMMAND_ID}"
 
-          for i in {1..60}; do
+          for i in {1..90}; do
             STATUS="$(aws ssm get-command-invocation \
               --command-id "${COMMAND_ID}" \
               --instance-id "${INSTANCE_ID}" \
@@ -368,5 +431,4 @@ jobs:
         shell: bash
         run: |
           echo "DAST URL: ${{ needs.provision-ec2-cfn.outputs.dast_url }}"
-          echo "DNS Name: ${{ needs.provision-ec2-cfn.outputs.dns_name }}"
-          echo "Public IP: ${{ needs.provision-ec2-cfn.outputs.public_ip }}"
+          echo "TLS probe: ${{ needs.provision-ec2-cfn.outputs.dast_url }}/tls-info"
