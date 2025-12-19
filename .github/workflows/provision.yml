@@ -24,6 +24,12 @@ on:
           - Weak
           - Secure
 
+      DEBUG_LOGS:
+        description: "Include verbose diagnostics (nginx -T, docker inspect, journals)."
+        required: true
+        default: false
+        type: boolean
+
   push:
     branches: ["main"]
 
@@ -34,6 +40,9 @@ env:
   APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
   SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
   TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
+
+  # Boolean -> string "true"/"false"
+  DEBUG_LOGS: ${{ (inputs.DEBUG_LOGS && 'true') || 'false' }}
 
   ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
   IMAGE_TAG: ${{ github.run_id }}
@@ -109,7 +118,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
           APP="$(norm "${APP_NAME}")"
@@ -147,7 +155,6 @@ jobs:
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
           [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
-          echo "InstanceId: ${INSTANCE_ID}"
 
           aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
           aws ec2 wait instance-status-ok --instance-ids "${INSTANCE_ID}"
@@ -170,7 +177,6 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)"
           [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: Instance has no Public IP"; exit 1; }
-          echo "PublicIP: ${PUBLIC_IP}"
 
           APP_DNS="$(echo "${APP}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
           ACR_DNS="$(echo "${ACR}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' | sed 's/^-*//;s/-*$//')"
@@ -273,7 +279,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (defensive cleanup; ECR helper; nginx) and print logs
+      - name: Deploy via SSM (always slim logs; optional verbose logs)
         shell: bash
         run: |
           set -euo pipefail
@@ -281,16 +287,18 @@ jobs:
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
           TLS_MODE="${TLS_MODE}"
+          DEBUG="${DEBUG_LOGS}"
 
-          export INSTANCE_ID IMAGE_URI TLS_MODE
+          export IMAGE_URI TLS_MODE DEBUG
 
           python3 - <<'PY'
-          import json, os
+          import base64, json, os
 
           image = os.environ["IMAGE_URI"]
-          tls = os.environ.get("TLS_MODE", "Weak").strip()
+          tls = (os.environ.get("TLS_MODE","Weak") or "Weak").strip().lower()
+          debug = (os.environ.get("DEBUG","false") or "false").strip().lower()
 
-          if tls.lower() == "secure":
+          if tls == "secure":
               nginx_tls = "\n".join([
                   "  ssl_protocols TLSv1.2 TLSv1.3;",
                   "  ssl_prefer_server_ciphers on;",
@@ -306,39 +314,7 @@ jobs:
               ])
               mode_text = "Weak"
 
-          # Use bash on the instance (pipefail-safe) and avoid *any* heredoc terminators in the workflow YAML.
-          script = f"""#!/usr/bin/env bash
-          set -euo pipefail
-
-          echo "=== OS ==="
-          cat /etc/os-release || true
-
-          echo "=== Defensive cleanup: remove Docker apt repo & conflicting packages ==="
-          sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker*.list || true
-          sudo rm -f /etc/apt/keyrings/docker.gpg || true
-          sudo apt-get remove -y containerd.io docker-ce docker-ce-cli docker-buildx-plugin docker-compose-plugin || true
-          sudo apt-get autoremove -y || true
-
-          echo "=== Install deps (Ubuntu packages) ==="
-          sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io nginx openssl ca-certificates curl amazon-ecr-credential-helper
-
-          echo "=== Enable services ==="
-          sudo systemctl enable --now docker
-          sudo systemctl enable --now nginx
-
-          echo "=== Docker: use ECR credential helper (no awscli needed) ==="
-          sudo install -d -m 700 /root/.docker
-          echo '{{"credsStore":"ecr-login"}}' | sudo tee /root/.docker/config.json >/dev/null
-
-          echo "=== Cert ==="
-          sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
-            -keyout /etc/nginx/self.key -out /etc/nginx/self.crt -subj "/CN=localhost" || true
-
-          echo "=== Write NGINX config ==="
-          sudo install -d /etc/nginx/conf.d
-          sudo bash -lc 'cat > /etc/nginx/conf.d/app.conf' <<'EOF'
-          server {{
+          nginx_conf = f"""server {{
             listen 443 ssl;
             ssl_certificate     /etc/nginx/self.crt;
             ssl_certificate_key /etc/nginx/self.key;
@@ -351,34 +327,75 @@ jobs:
               proxy_pass http://127.0.0.1:5000;
             }}
           }}
-          EOF
-
-          sudo rm -f /etc/nginx/sites-enabled/default || true
-          sudo nginx -t
-          sudo systemctl restart nginx
-
-          echo "=== Pull & run container ==="
-          sudo docker pull "{image}"
-          sudo docker rm -f petstore || true
-          sudo docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 "{image}" || true
-
-          echo "=== Diagnostics ==="
-          echo "listeners:"; sudo ss -lntp | egrep "(:443|:5000)" || true
-          echo "nginx err:"; sudo tail -n 120 /var/log/nginx/error.log || true
-          echo "petstore logs:"; sudo docker logs --tail 200 petstore || true
-          echo "DONE"
           """
 
-          params = {
-              "commands": [
-                  "cat > /tmp/deploy.sh <<'EOF'\n" + script + "\nEOF",
-                  "chmod +x /tmp/deploy.sh",
-                  "/tmp/deploy.sh"
-              ]
-          }
+          docker_cfg = '{"credsStore":"ecr-login"}\n'
 
-          with open("ssm-params.json", "w") as f:
-              json.dump(params, f)
+          b64_nginx = base64.b64encode(nginx_conf.encode()).decode()
+          b64_dcfg  = base64.b64encode(docker_cfg.encode()).decode()
+
+          commands = [
+            "set -euo pipefail",
+
+            "echo '=== OS ==='; cat /etc/os-release || true",
+
+            "echo '=== Defensive cleanup (docker repo + conflicts) ==='",
+            "sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker*.list || true",
+            "sudo rm -f /etc/apt/keyrings/docker.gpg || true",
+            "sudo apt-get remove -y containerd.io docker-ce docker-ce-cli docker-buildx-plugin docker-compose-plugin || true",
+            "sudo apt-get autoremove -y || true",
+
+            "echo '=== Install deps (Ubuntu packages) ==='",
+            "sudo apt-get update -y",
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io nginx openssl ca-certificates curl amazon-ecr-credential-helper",
+
+            "echo '=== Enable services ==='",
+            "sudo systemctl enable --now docker",
+            "sudo systemctl enable --now nginx",
+
+            "echo '=== Docker: ECR credential helper ==='",
+            "sudo install -d -m 700 /root/.docker",
+            f"echo '{b64_dcfg}' | base64 -d | sudo tee /root/.docker/config.json >/dev/null",
+            "sudo ls -l /root/.docker/config.json || true",
+
+            "echo '=== Cert ==='",
+            "sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 "
+            "-keyout /etc/nginx/self.key -out /etc/nginx/self.crt -subj '/CN=localhost' || true",
+
+            "echo '=== NGINX config ==='",
+            "sudo install -d /etc/nginx/conf.d",
+            f"echo '{b64_nginx}' | base64 -d | sudo tee /etc/nginx/conf.d/app.conf >/dev/null",
+            "sudo rm -f /etc/nginx/sites-enabled/default || true",
+            "sudo /usr/sbin/nginx -t",
+            "sudo systemctl restart nginx",
+
+            "echo '=== Pull & run container ==='",
+            f"sudo docker pull '{image}'",
+            "sudo docker rm -f petstore || true",
+            f"sudo docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 '{image}'",
+
+            "echo '=== Diagnostics (slim) ==='",
+            "echo 'listeners:'; sudo ss -lntp | egrep ':(443|:5000)\\b' || true",
+            "echo 'nginx status:'; sudo systemctl status nginx --no-pager || true",
+            "echo 'nginx app.conf (head):'; sudo sed -n '1,200p' /etc/nginx/conf.d/app.conf || true",
+            "echo 'nginx err (tail):'; sudo tail -n 120 /var/log/nginx/error.log || true",
+            "echo 'petstore logs (tail):'; sudo docker logs --tail 200 petstore || true",
+          ]
+
+          if debug == "true":
+              commands += [
+                "echo '=== Diagnostics (VERBOSE) ==='",
+                "echo 'nginx -T (head):'; sudo /usr/sbin/nginx -T 2>&1 | sed -n '1,400p' || true",
+                "echo 'docker ps -a:'; sudo docker ps -a || true",
+                "echo 'docker inspect petstore (head):'; sudo docker inspect petstore 2>/dev/null | sed -n '1,200p' || true",
+                "echo 'journalctl nginx (tail):'; sudo journalctl -u nginx --no-pager -n 200 || true",
+                "echo 'journalctl docker (tail):'; sudo journalctl -u docker --no-pager -n 200 || true",
+              ]
+
+          commands += ["echo DONE"]
+
+          with open("ssm-params.json","w") as f:
+            json.dump({"commands": commands}, f)
           print("Wrote ssm-params.json")
           PY
 
@@ -425,3 +442,4 @@ jobs:
         run: |
           echo "DAST URL: ${{ needs.provision-ec2.outputs.dast_url }}"
           echo "Test:     ${{ needs.provision-ec2.outputs.dast_url }}/tls-info"
+          echo "DEBUG_LOGS: ${DEBUG_LOGS}"
