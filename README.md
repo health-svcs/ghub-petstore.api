@@ -1,4 +1,4 @@
-### General notes  12-18-25 testing the new DNS and many new variables.
+### General notes  12-19-25testing the new DNS and many new variables.
 
 This is a bit of a hack, in that both the app and the database (MairaDB) are on the same image/container.
 
