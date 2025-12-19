@@ -90,7 +90,6 @@ jobs:
       dns_name: ${{ steps.dns.outputs.dns_name }}
       dast_url: ${{ steps.dns.outputs.dast_url }}
       ecr_repo: ${{ steps.names.outputs.ecr_repo }}
-      stack_name: ${{ steps.names.outputs.stack_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -114,7 +113,6 @@ jobs:
           echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
 
           echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
-          echo "stack_name=${STACK_NAME}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -153,10 +151,7 @@ jobs:
             --stack-name "${STACK_NAME}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
-          if [[ -z "${INSTANCE_ID}" || "${INSTANCE_ID}" == "None" ]]; then
-            echo "ERROR: Could not resolve ApiInstance physical resource id."
-            exit 1
-          fi
+          [[ -n "${INSTANCE_ID}" && "${INSTANCE_ID}" != "None" ]] || { echo "ERROR: Could not resolve ApiInstance"; exit 1; }
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Public IP
@@ -168,10 +163,7 @@ jobs:
             --instance-ids "${{ steps.cfnout.outputs.instance_id }}" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)"
-          if [[ -z "${PUBLIC_IP}" || "${PUBLIC_IP}" == "None" ]]; then
-            echo "ERROR: Instance has no PublicIpAddress yet."
-            exit 1
-          fi
+          [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "None" ]] || { echo "ERROR: Instance has no Public IP"; exit 1; }
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
       - name: Update DNS (Route53 A record)
@@ -182,7 +174,6 @@ jobs:
 
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
-          # Normalize and remove unsupported characters for DNS labels
           APP_RAW="$(norm "${APP_NAME}")"
           ACR_RAW="$(norm "${SA_ACRONYM}")"
           BASE_RAW="$(norm "${DNS_BASE_DOMAIN}")"
@@ -191,14 +182,12 @@ jobs:
           ACR_DNS="$(echo "${ACR_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' | sed 's/^-*//;s/-*$//')"
           BASE_DNS="$(echo "${BASE_RAW}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9.-' | sed 's/^\.*//;s/\.*$//')"
 
-          DNS_NAME="${APP_DNS}.${ACR_DNS}.${BASE_DNS}."
-          DAST_URL="https://${APP_DNS}.${ACR_DNS}.${BASE_DNS}"
-
-          echo "DNS_NAME=${DNS_NAME}"
-          echo "PUBLIC_IP=${{ steps.pubip.outputs.public_ip }}"
+          DNS_NAME="${APP_DNS}.${ACR_DNS}.${BASE_DNS}"
+          DNS_NAME_DOT="${DNS_NAME}."
+          DAST_URL="https://${DNS_NAME}"
 
           jq -n \
-            --arg name "${DNS_NAME}" \
+            --arg name "${DNS_NAME_DOT}" \
             --arg ip "${{ steps.pubip.outputs.public_ip }}" \
             --argjson ttl ${DNS_TTL} \
             '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:$name,Type:"A",TTL:$ttl,ResourceRecords:[{Value:$ip}]}}]}' \
@@ -210,16 +199,6 @@ jobs:
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
-
-      - name: Summary
-        shell: bash
-        run: |
-          echo "Instance: ${{ steps.cfnout.outputs.instance_id }}"
-          echo "Public IP: ${{ steps.pubip.outputs.public_ip }}"
-          echo "DNS: ${{ steps.dns.outputs.dns_name }}"
-          echo "DAST URL: ${{ steps.dns.outputs.dast_url }}"
-          echo "ECR repo: ${{ steps.names.outputs.ecr_repo }}"
-          echo "Stack: ${STACK_NAME}"
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -259,7 +238,6 @@ jobs:
           aws ecr get-login-password --region "${AWS_REGION}" | \
             docker login --username AWS --password-stdin "${REGISTRY}"
 
-          docker version
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
 
@@ -278,7 +256,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy container via SSM
+      - name: Deploy via SSM (auto-detect container port + diagnostics)
         shell: bash
         run: |
           set -euo pipefail
@@ -295,7 +273,7 @@ jobs:
 
           echo "=== Ensure tools ==="
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli curl jq
 
           echo "=== Docker service ==="
           sudo systemctl enable --now docker
@@ -306,16 +284,38 @@ jobs:
           aws ecr get-login-password --region AWS_REGION | \
             docker login --username AWS --password-stdin REGISTRY
 
-          echo "=== Pull & run ==="
+          echo "=== Pull image ==="
           docker pull IMAGE_URI
+
+          echo "=== Detect exposed container port (fallback 5000) ==="
+          EXPOSED="$(docker image inspect IMAGE_URI --format '{{json .Config.ExposedPorts}}' || true)"
+          PORT="$(echo "$EXPOSED" | jq -r 'keys[0] // empty' | sed 's#/tcp##' || true)"
+          if [[ -z "$PORT" ]]; then PORT="5000"; fi
+          echo "Detected container port: $PORT"
+
+          echo "=== Run container: host 127.0.0.1:5000 -> container:$PORT ==="
           docker rm -f petstore || true
-          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 IMAGE_URI
+          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:"$PORT" IMAGE_URI
+
+          echo "=== Containers ==="
+          docker ps -a || true
+
+          echo "=== petstore logs (tail) ==="
+          docker logs --tail 200 petstore || true
+
+          echo "=== Listening ports (host) ==="
+          sudo ss -lntp | grep -E '(:443|:5000)' || true
+
+          echo "=== Local upstream test ==="
+          curl -sS -o /dev/null -w "http://127.0.0.1:5000/ => HTTP %{http_code}\n" http://127.0.0.1:5000/ || true
 
           echo "=== NGINX validate + restart ==="
-          sudo nginx -t
-          sudo systemctl restart nginx
+          sudo nginx -t || true
+          sudo systemctl restart nginx || true
+          sudo systemctl status nginx --no-pager || true
 
-          echo "=== Done ==="
+          echo "=== NGINX error log (tail) ==="
+          sudo tail -n 80 /var/log/nginx/error.log || true
           EOF
 
           sed -i "s|IMAGE_URI|${IMAGE_URI}|g" remote.sh
@@ -337,14 +337,12 @@ jobs:
 
           echo "SSM CommandId: ${COMMAND_ID}"
 
-          echo "=== Wait for SSM completion ==="
           for i in {1..60}; do
             STATUS="$(aws ssm get-command-invocation \
               --command-id "${COMMAND_ID}" \
               --instance-id "${INSTANCE_ID}" \
               --query "Status" \
               --output text || true)"
-
             echo "Status: ${STATUS}"
             case "${STATUS}" in
               Success|Cancelled|TimedOut|Failed) break ;;
@@ -352,14 +350,14 @@ jobs:
             sleep 5
           done
 
-          echo "=== Command output (stdout) ==="
+          echo "=== SSM stdout ==="
           aws ssm get-command-invocation \
             --command-id "${COMMAND_ID}" \
             --instance-id "${INSTANCE_ID}" \
             --query "StandardOutputContent" \
             --output text || true
 
-          echo "=== Command output (stderr) ==="
+          echo "=== SSM stderr ==="
           aws ssm get-command-invocation \
             --command-id "${COMMAND_ID}" \
             --instance-id "${INSTANCE_ID}" \
