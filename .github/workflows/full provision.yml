@@ -68,6 +68,11 @@ jobs:
           require "HOSTED_ZONE_ID_SA" "${{ vars.HOSTED_ZONE_ID_SA }}"
           require "SA_BASE_DOMAIN" "${{ vars.SA_BASE_DOMAIN }}"
 
+          if ! [[ "${DNS_TTL}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: DNS_TTL must be numeric, got: '${DNS_TTL}'"
+            exit 1
+          fi
+
           if [[ "${DEMO_OWNER}" == "github-actions" || "${DEMO_OWNER}" == *"[bot]" ]]; then
             echo "ERROR: Refusing to provision for automation actor: ${DEMO_OWNER}"
             exit 1
@@ -85,6 +90,7 @@ jobs:
       dns_name: ${{ steps.dns.outputs.dns_name }}
       dast_url: ${{ steps.dns.outputs.dast_url }}
       ecr_repo: ${{ steps.names.outputs.ecr_repo }}
+      stack_name: ${{ steps.names.outputs.stack_name }}
 
     steps:
       - uses: actions/checkout@v4
@@ -97,9 +103,6 @@ jobs:
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
           APP="$(norm "${APP_NAME}")"
-          ACR="$(norm "${SA_ACRONYM}")"
-          BASE="$(norm "${DNS_BASE_DOMAIN}")"
-
           SAFE_STACK_APP="$(echo "${APP}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           SAFE_ACTOR="$(norm "${GITHUB_ACTOR}" | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_STACK_APP}-ec2-${SAFE_ACTOR}-${GITHUB_RUN_ID}"
@@ -109,7 +112,9 @@ jobs:
 
           echo "STACK_NAME=${STACK_NAME}" >> "$GITHUB_ENV"
           echo "SANITIZED_ECR_REPO=${SAFE_ECR}" >> "$GITHUB_ENV"
+
           echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
+          echo "stack_name=${STACK_NAME}" >> "$GITHUB_OUTPUT"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -120,47 +125,61 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           aws cloudformation deploy \
             --stack-name "${STACK_NAME}" \
             --template-file "${TEMPLATE_FILE}" \
             --parameter-overrides \
-              AMIId=${{ vars.AMI_ID }} \
-              InstanceType=${{ vars.INSTANCE_TYPE }} \
-              SubnetId=${{ vars.SUBNET_ID }} \
-              SecurityGroupIds=${{ vars.SG_IDS }} \
-              IamInstanceProfileName=${{ vars.INSTANCE_PROFILE_NAME }} \
-              KeyName=${{ vars.KEY_NAME }} \
-              DeployTagKey=DemoOwner \
-              DeployTagValue=${DEMO_OWNER} \
-              AppName=${APP_NAME} \
-              TlsMode=${TLS_MODE} \
-              ImageTag=${IMAGE_TAG} \
+              "AMIId=${{ vars.AMI_ID }}" \
+              "InstanceType=${{ vars.INSTANCE_TYPE }}" \
+              "SubnetId=${{ vars.SUBNET_ID }}" \
+              "SecurityGroupIds=${{ vars.SG_IDS }}" \
+              "IamInstanceProfileName=${{ vars.INSTANCE_PROFILE_NAME }}" \
+              "KeyName=${{ vars.KEY_NAME }}" \
+              "DeployTagKey=DemoOwner" \
+              "DeployTagValue=${DEMO_OWNER}" \
+              "AppName=${APP_NAME}" \
+              "TlsMode=${TLS_MODE}" \
+              "ImageTag=${IMAGE_TAG}" \
+            --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
 
       - name: Resolve Instance ID
         id: cfnout
         shell: bash
         run: |
+          set -euo pipefail
           INSTANCE_ID="$(aws cloudformation describe-stack-resources \
             --stack-name "${STACK_NAME}" \
             --query "StackResources[?LogicalResourceId=='ApiInstance'].PhysicalResourceId" \
             --output text)"
+          if [[ -z "${INSTANCE_ID}" || "${INSTANCE_ID}" == "None" ]]; then
+            echo "ERROR: Could not resolve ApiInstance physical resource id."
+            exit 1
+          fi
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Public IP
         id: pubip
         shell: bash
         run: |
+          set -euo pipefail
           PUBLIC_IP="$(aws ec2 describe-instances \
             --instance-ids "${{ steps.cfnout.outputs.instance_id }}" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)"
+          if [[ -z "${PUBLIC_IP}" || "${PUBLIC_IP}" == "None" ]]; then
+            echo "ERROR: Instance has no PublicIpAddress yet."
+            exit 1
+          fi
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
 
-      - name: Update DNS
+      - name: Update DNS (Route53 A record)
         id: dns
         shell: bash
         run: |
+          set -euo pipefail
+
           DNS_NAME="${APP_NAME}.${SA_ACRONYM}.${DNS_BASE_DOMAIN}"
           DAST_URL="https://${DNS_NAME}"
 
@@ -177,6 +196,16 @@ jobs:
 
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Instance: ${{ steps.cfnout.outputs.instance_id }}"
+          echo "Public IP: ${{ steps.pubip.outputs.public_ip }}"
+          echo "DNS: ${{ steps.dns.outputs.dns_name }}"
+          echo "DAST URL: ${{ steps.dns.outputs.dast_url }}"
+          echo "ECR repo: ${{ steps.names.outputs.ecr_repo }}"
+          echo "Stack: ${STACK_NAME}"
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -195,15 +224,31 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Build & Push
+      - name: Ensure ECR repo exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ECR="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
+          aws ecr describe-repositories --repository-names "${ECR}" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "${ECR}" >/dev/null
+
+      - name: Build & Push (ECR)
         id: img
         shell: bash
         run: |
+          set -euo pipefail
+
           ECR="${{ needs.provision-ec2-cfn.outputs.ecr_repo }}"
-          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR}:${IMAGE_TAG}"
-          aws ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${REGISTRY}/${ECR}:${IMAGE_TAG}"
+
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin "${REGISTRY}"
+
+          docker version
           docker build -t "${IMAGE_URI}" .
           docker push "${IMAGE_URI}"
+
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
   deploy-to-ec2:
@@ -226,25 +271,90 @@ jobs:
 
           INSTANCE_ID="${{ needs.provision-ec2-cfn.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-          cat <<'EOF' > remote.sh
+          cat > remote.sh <<'EOF'
           set -euo pipefail
+
+          echo "=== OS ==="
+          cat /etc/os-release || true
+
+          echo "=== Ensure tools ==="
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io awscli
+
+          echo "=== Docker service ==="
           sudo systemctl enable --now docker
-          aws ecr get-login-password | docker login --username AWS --password-stdin
+          docker --version
+          sudo systemctl status docker --no-pager || true
+
+          echo "=== ECR login ==="
+          aws ecr get-login-password --region AWS_REGION | \
+            docker login --username AWS --password-stdin REGISTRY
+
+          echo "=== Pull & run ==="
           docker pull IMAGE_URI
           docker rm -f petstore || true
-          docker run -d --name petstore -p 127.0.0.1:5000:5000 IMAGE_URI
+          docker run -d --name petstore --restart unless-stopped -p 127.0.0.1:5000:5000 IMAGE_URI
+
+          echo "=== NGINX validate + restart ==="
           sudo nginx -t
           sudo systemctl restart nginx
+
+          echo "=== Done ==="
           EOF
 
           sed -i "s|IMAGE_URI|${IMAGE_URI}|g" remote.sh
+          sed -i "s|REGISTRY|${REGISTRY}|g" remote.sh
+          sed -i "s|AWS_REGION|${AWS_REGION}|g" remote.sh
 
           B64="$(base64 -w0 remote.sh)"
+          PARAMS="$(jq -nc --arg cmd "echo ${B64} | base64 -d | bash" '{commands:[$cmd]}')"
 
-          aws ssm send-command \
-            --instance-ids "${INSTANCE_ID}" \
-            --document-name AWS-RunShellScript \
-            --parameters "{\"commands\":[\"echo ${B64} | base64 -d | bash\"]}"
+          COMMAND_ID="$(
+            aws ssm send-command \
+              --instance-ids "${INSTANCE_ID}" \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy ${IMAGE_URI}" \
+              --parameters "${PARAMS}" \
+              --query "Command.CommandId" \
+              --output text
+          )"
+
+          echo "SSM CommandId: ${COMMAND_ID}"
+
+          echo "=== Wait for SSM completion ==="
+          for i in {1..60}; do
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query "Status" \
+              --output text || true)"
+
+            echo "Status: ${STATUS}"
+            case "${STATUS}" in
+              Success|Cancelled|TimedOut|Failed) break ;;
+            esac
+            sleep 5
+          done
+
+          echo "=== Command output (stdout) ==="
+          aws ssm get-command-invocation \
+            --command-id "${COMMAND_ID}" \
+            --instance-id "${INSTANCE_ID}" \
+            --query "StandardOutputContent" \
+            --output text || true
+
+          echo "=== Command output (stderr) ==="
+          aws ssm get-command-invocation \
+            --command-id "${COMMAND_ID}" \
+            --instance-id "${INSTANCE_ID}" \
+            --query "StandardErrorContent" \
+            --output text || true
+
+      - name: Print endpoint
+        shell: bash
+        run: |
+          echo "DAST URL: ${{ needs.provision-ec2-cfn.outputs.dast_url }}"
+          echo "DNS Name: ${{ needs.provision-ec2-cfn.outputs.dns_name }}"
+          echo "Public IP: ${{ needs.provision-ec2-cfn.outputs.public_ip }}"
