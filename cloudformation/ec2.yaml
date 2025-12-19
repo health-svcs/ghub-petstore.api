@@ -5,31 +5,25 @@ Parameters:
   AMIId:
     Type: String
     Description: "AMI ID to launch from"
-
   InstanceType:
     Type: String
     Description: "EC2 instance type"
-
   SubnetId:
     Type: String
     Description: "Subnet ID"
-
   SecurityGroupIds:
     Type: CommaDelimitedList
     Description: "Security group IDs"
-
   IamInstanceProfileName:
     Type: String
     Description: "IAM instance profile name"
-
   KeyName:
     Type: String
-    Description: "EC2 Key Pair name"
+    Description: "EC2 key pair name"
 
   DeployTagKey:
     Type: String
     Description: "Tag key used to identify demo owner"
-
   DeployTagValue:
     Type: String
     Description: "Tag value used to identify demo owner"
@@ -38,18 +32,6 @@ Parameters:
     Type: String
     Default: "petstore.api"
     Description: "App label for tagging/DNS"
-
-  Environment:
-    Type: String
-    Default: "QA"
-    AllowedValues: ["Dev", "QA", "Prod"]
-    Description: "Environment label"
-
-  Demo:
-    Type: String
-    Default: "LiveDemo"
-    Description: "Demo label"
-
   ImageTag:
     Type: String
     Default: "unknown"
@@ -77,10 +59,6 @@ Resources:
           Value: !Ref DeployTagValue
         - Key: "App"
           Value: !Ref AppName
-        - Key: "Environment"
-          Value: !Ref Environment
-        - Key: "Demo"
-          Value: !Ref Demo
         - Key: "TlsMode"
           Value: !Ref TlsMode
         - Key: "ImageTag"
@@ -97,19 +75,18 @@ Resources:
           echo "=== OS ==="
           cat /etc/os-release || true
 
-          echo "=== Install nginx + cert tooling ==="
+          echo "=== Install nginx + openssl ==="
           apt-get update -y
           DEBIAN_FRONTEND=noninteractive apt-get install -y nginx openssl ca-certificates
 
-          echo "=== Create self-signed cert ==="
-          install -d -m 0755 /etc/nginx
+          echo "=== Self-signed cert ==="
           openssl req -x509 -nodes -days 365 \
             -newkey rsa:2048 \
             -keyout /etc/nginx/self.key \
             -out /etc/nginx/self.crt \
             -subj "/CN=${AppName}"
 
-          echo "=== Write nginx config (${TlsMode}) ==="
+          echo "=== Write nginx config ==="
           mkdir -p /etc/nginx/conf.d
 
           if [ "$TLS_MODE" = "Weak" ]; then
@@ -121,7 +98,7 @@ Resources:
             ssl_certificate_key /etc/nginx/self.key;
 
             ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
-            ssl_ciphers   'ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-SHA:AES256-SHA';
+            ssl_ciphers   HIGH:!aNULL:!MD5;
             ssl_prefer_server_ciphers on;
 
             location = /tls-info {
@@ -146,7 +123,7 @@ NGINXCONF
             ssl_certificate_key /etc/nginx/self.key;
 
             ssl_protocols TLSv1.2 TLSv1.3;
-            ssl_ciphers   'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
+            ssl_ciphers   ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
             ssl_prefer_server_ciphers on;
 
             add_header Strict-Transport-Security "max-age=63072000" always;
@@ -166,10 +143,7 @@ NGINXCONF
 NGINXCONF
           fi
 
-          echo "=== Disable default site if present ==="
           rm -f /etc/nginx/sites-enabled/default || true
-
-          echo "=== Validate + restart nginx ==="
           nginx -t
           systemctl enable nginx
           systemctl restart nginx
@@ -178,9 +152,7 @@ NGINXCONF
 Outputs:
   InstanceId:
     Value: !Ref ApiInstance
-
   TlsMode:
     Value: !Ref TlsMode
-
   ImageTag:
     Value: !Ref ImageTag
