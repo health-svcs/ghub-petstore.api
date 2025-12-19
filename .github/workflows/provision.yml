@@ -437,10 +437,56 @@ jobs:
             --output text || true
 
           test "${STATUS}" = "Success"
-
-      - name: Print endpoint
+     
+      - name: Print endpoint + write summary
         shell: bash
         run: |
-          echo "DAST URL: ${{ needs.provision-ec2.outputs.dast_url }}"
-          echo "Test:     ${{ needs.provision-ec2.outputs.dast_url }}/tls-info"
-          echo "DEBUG_LOGS: ${DEBUG_LOGS}"
+          set -euo pipefail
+
+          # From workflow env / inputs
+          APP_NAME="${APP_NAME}"
+          SA_ACRONYM="${SA_ACRONYM}"
+          TLS_MODE="${TLS_MODE}"
+          DEBUG_LOGS="${DEBUG_LOGS}"
+          AWS_REGION="${AWS_REGION}"
+
+          # From provision-ec2 job outputs
+          DAST_URL="${{ needs.provision-ec2.outputs.dast_url }}"
+          DNS_NAME="${{ needs.provision-ec2.outputs.dns_name }}"
+          PUBLIC_IP="${{ needs.provision-ec2.outputs.public_ip }}"
+          INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
+          ECR_REPO="${{ needs.provision-ec2.outputs.ecr_repo }}"
+
+          # From build-and-push outputs (available because this step is in deploy job which needs build-and-push)
+          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+
+          # Keep normal log output (handy when summary is collapsed)
+          echo "DAST URL:    ${DAST_URL}"
+          echo "TLS Test:    ${DAST_URL}/tls-info"
+          echo "DNS Name:    ${DNS_NAME}"
+          echo "Public IP:   ${PUBLIC_IP}"
+          echo "Instance ID: ${INSTANCE_ID}"
+          echo "Image URI:   ${IMAGE_URI}"
+          echo "DEBUG_LOGS:  ${DEBUG_LOGS}"
+
+          # GitHub Actions Summary (what you actually want)
+          {
+            echo "## 🚀 Deployment Summary"
+            echo ""
+            echo "- **App:** ${APP_NAME:-unknown}"
+            echo "- **SA Acronym:** ${SA_ACRONYM:-unknown}"
+            echo "- **Region:** ${AWS_REGION:-unknown}"
+            echo "- **TLS Mode:** ${TLS_MODE:-unknown}"
+            echo "- **Debug Logs:** ${DEBUG_LOGS:-false}"
+            echo ""
+            echo "### 🌐 Endpoint"
+            echo "- **DAST URL:** [${DAST_URL:-not-set}](${DAST_URL:-})"
+            echo "- **TLS Test:** [${DAST_URL:-not-set}/tls-info](${DAST_URL:-}/tls-info)"
+            echo "- **DNS Name:** \`${DNS_NAME:-not-set}\`"
+            echo "- **Public IP:** \`${PUBLIC_IP:-not-set}\`"
+            echo ""
+            echo "### 🖥️ Infrastructure"
+            echo "- **Instance ID:** \`${INSTANCE_ID:-not-set}\`"
+            echo "- **ECR Repo:** \`${ECR_REPO:-not-set}\`"
+            echo "- **Image URI:** \`${IMAGE_URI:-not-set}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
