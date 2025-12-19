@@ -44,6 +44,20 @@ Parameters:
     AllowedValues: ["Weak", "Secure"]
     Description: "TLS posture label (applied by SSM deploy step)"
 
+  # --- NEW: GitHub identity for EC2 Name tag ---
+  RepoOrg:
+    Type: String
+    Default: "unknown-org"
+    Description: "GitHub org/owner (e.g., health-svcs)"
+  RepoName:
+    Type: String
+    Default: "unknown-repo"
+    Description: "GitHub repo name (e.g., agc-petstore.api)"
+  RunId:
+    Type: String
+    Default: "unknown-run"
+    Description: "GitHub run id for traceability"
+
 Resources:
   ApiInstance:
     Type: "AWS::EC2::Instance"
@@ -64,8 +78,10 @@ Resources:
           Value: !Ref TlsMode
         - Key: "ImageTag"
           Value: !Ref ImageTag
+
+        # UPDATED: EC2 "Name" tag (no AppName prefix anymore)
         - Key: "Name"
-          Value: !Sub "${AppName}-${AWS::StackName}"
+          Value: !Sub "${RepoOrg}-${RepoName}-ec2-${RunId}"
 
 Outputs:
   InstanceId:
