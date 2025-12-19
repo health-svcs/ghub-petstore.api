@@ -267,7 +267,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy via SSM (nginx + TLS + container) and always print logs
+      - name: Deploy via SSM (sh-safe: no pipefail) and always print logs
         shell: bash
         run: |
           set -euo pipefail
@@ -286,6 +286,7 @@ jobs:
 
           python3 - <<'PY'
           import json, os
+
           image = os.environ["IMAGE_URI"]
           tls = os.environ.get("TLS_MODE", "Weak")
 
@@ -305,10 +306,12 @@ jobs:
           """
               mode_text = "Weak"
 
-          script = f"""#!/usr/bin/env bash
-          set -euo pipefail
+          # POSIX sh script (no pipefail)
+          script = f"""#!/bin/sh
+          set -eu
 
-          echo "=== OS ==="; cat /etc/os-release || true
+          echo "=== OS ==="
+          cat /etc/os-release || true
 
           echo "=== Install deps ==="
           sudo apt-get update -y
@@ -363,7 +366,6 @@ jobs:
 
           params = {
               "commands": [
-                  "set -euo pipefail",
                   "cat > /tmp/deploy.sh <<'EOF'\n" + script + "\nEOF",
                   "chmod +x /tmp/deploy.sh",
                   "/tmp/deploy.sh"
@@ -385,7 +387,7 @@ jobs:
           )"
           echo "SSM CommandId: ${COMMAND_ID}"
 
-          # Poll for up to ~5 minutes (60 * 5s) so we always print logs
+          # Poll for up to ~5 minutes (60 * 5s)
           STATUS="Unknown"
           for i in {1..60}; do
             STATUS="$(aws ssm get-command-invocation \
