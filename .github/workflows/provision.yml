@@ -37,33 +37,25 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
-  # Use workflow_dispatch inputs when present; otherwise fall back to repo vars for push events.
-  APP_NAME: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-  SA_ACRONYM: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
-  TLS_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
-  DEBUG_LOGS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DEBUG_LOGS || 'false' }}
-
-  # ECR repo name derived from app name (sanitized later)
-  ECR_REPO_RAW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-
   TEMPLATE_FILE: cloudformation/ec2.yaml
-
-  DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
 
   HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID_SA }}
   DNS_BASE_DOMAIN: ${{ vars.SA_BASE_DOMAIN }}
   DNS_TTL: ${{ vars.DNS_TTL || '60' }}
 
+  DEMO_OWNER: ${{ vars.DEMO_OWNER || github.actor }}
+
 jobs:
   validate-inputs:
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ steps.compute.outputs.image_tag }}
-      ecr_repo: ${{ steps.compute.outputs.ecr_repo }}
       app_name: ${{ steps.compute.outputs.app_name }}
       sa_acronym: ${{ steps.compute.outputs.sa_acronym }}
-      tls_mode: ${{ steps.compute.outputs.tls_mode }}
+      tls_lc: ${{ steps.compute.outputs.tls_lc }}
+      tls_label: ${{ steps.compute.outputs.tls_label }}
       debug_logs: ${{ steps.compute.outputs.debug_logs }}
+      ecr_repo: ${{ steps.compute.outputs.ecr_repo }}
+      image_tag: ${{ steps.compute.outputs.image_tag }}
     steps:
       - name: Validate required repo/org variables
         shell: bash
@@ -97,48 +89,61 @@ jobs:
             exit 1
           fi
 
-      - name: Compute stable ECR repo + stable image tag (2 tags per SA: weak/secure)
+      - name: Compute effective inputs + stable ECR tag (2 tags per SA)
         id: compute
         shell: bash
         run: |
           set -euo pipefail
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
-          APP="$(norm "${APP_NAME}")"
-          ACR="$(norm "${SA_ACRONYM}")"
-          TLS="$(norm "${TLS_MODE}")"
-          DBG="$(norm "${DEBUG_LOGS}")"
+          # On push events, workflow_dispatch inputs do not exist.
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            APP_RAW="${{ github.event.inputs.APP_NAME }}"
+            SA_RAW="${{ github.event.inputs.SA_ACRONYM }}"
+            TLS_RAW="${{ github.event.inputs.TlsMode }}"
+            DBG_RAW="${{ github.event.inputs.DEBUG_LOGS }}"
+          else
+            APP_RAW="${{ vars.APP_NAME_DEFAULT }}"
+            SA_RAW="${{ vars.SA_ACRONYM_DEFAULT }}"
+            TLS_RAW="${{ vars.TLSMODE_DEFAULT }}"
+            DBG_RAW="false"
+          fi
 
-          # normalize TLS to lowercase: weak|secure
+          APP="$(norm "${APP_RAW:-petstore.api}")"
+          SA="$(norm "${SA_RAW:-agc}")"
+          TLS="$(norm "${TLS_RAW:-Weak}")"
+          DBG="$(norm "${DBG_RAW:-false}")"
+
           TLS_LC="$(echo "${TLS}" | tr '[:upper:]' '[:lower:]')"
           case "${TLS_LC}" in
             weak|secure) ;;
-            *) echo "ERROR: TLS_MODE must be Weak or Secure, got '${TLS}'"; exit 1 ;;
+            *) echo "ERROR: TlsMode must be Weak or Secure, got '${TLS}'"; exit 1 ;;
           esac
 
-          # stable tag per SA+mode: agc-weak / agc-secure
-          ACR_LC="$(echo "${ACR}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' )"
-          [[ -n "${ACR_LC}" ]] || { echo "ERROR: SA_ACRONYM becomes empty after sanitization"; exit 1; }
-          IMAGE_TAG="${ACR_LC}-${TLS_LC}"
+          # Preserve original label for CFN tag values (Weak/Secure)
+          if [[ "${TLS_LC}" == "secure" ]]; then TLS_LABEL="Secure"; else TLS_LABEL="Weak"; fi
 
-          # ECR repo name: derived from app name, sanitized for ECR
-          SAFE_ECR="$(echo "${ECR_REPO_RAW:-petstore.api}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
-          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
+          SA_LC="$(echo "${SA}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' )"
+          [[ -n "${SA_LC}" ]] || { echo "ERROR: SA_ACRONYM becomes empty after sanitization"; exit 1; }
 
-          echo "Computed:"
-          echo "  APP_NAME=${APP}"
-          echo "  SA_ACRONYM=${ACR_LC}"
-          echo "  TLS_MODE=${TLS_LC}"
-          echo "  IMAGE_TAG=${IMAGE_TAG}"
-          echo "  ECR_REPO=${SAFE_ECR}"
-          echo "  DEBUG_LOGS=${DBG}"
+          # Stable image tag: agc-weak / agc-secure
+          IMAGE_TAG="${SA_LC}-${TLS_LC}"
+
+          # ECR repo name derived from app name, sanitized for ECR rules (no dots)
+          ECR_REPO="$(echo "${APP}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
+          [[ -n "${ECR_REPO}" ]] || ECR_REPO="petstore-api"
+
+          # Normalize debug to "true"/"false"
+          DBG_LC="$(echo "${DBG}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${DBG_LC}" == "true" ]]; then DBG_OUT="true"; else DBG_OUT="false"; fi
 
           echo "app_name=${APP}" >> "$GITHUB_OUTPUT"
-          echo "sa_acronym=${ACR_LC}" >> "$GITHUB_OUTPUT"
-          echo "tls_mode=${TLS_LC}" >> "$GITHUB_OUTPUT"
+          echo "sa_acronym=${SA_LC}" >> "$GITHUB_OUTPUT"
+          echo "tls_lc=${TLS_LC}" >> "$GITHUB_OUTPUT"
+          echo "tls_label=${TLS_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "debug_logs=${DBG_OUT}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
-          echo "debug_logs=${DBG}" >> "$GITHUB_OUTPUT"
 
   provision-ec2:
     runs-on: ubuntu-latest
@@ -171,20 +176,16 @@ jobs:
 
           APP="$(norm "${{ needs.validate-inputs.outputs.app_name }}")"
           ACR="$(norm "${{ needs.validate-inputs.outputs.sa_acronym }}")"
-          TLS_LC="$(norm "${{ needs.validate-inputs.outputs.tls_mode }}")"
+          TLS_LABEL="$(norm "${{ needs.validate-inputs.outputs.tls_label }}")"
           IMAGE_TAG="$(norm "${{ needs.validate-inputs.outputs.image_tag }}")"
           ECR_REPO="$(norm "${{ needs.validate-inputs.outputs.ecr_repo }}")"
           BASE="$(norm "${DNS_BASE_DOMAIN}")"
 
-          # Stack name: include ORG + REPO, unique per run id
           ORG_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           SAFE_ORG="$(echo "${ORG_NAME}"  | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           SAFE_REPO="$(echo "${REPO_NAME}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_ORG}-${SAFE_REPO}-ec2-${GITHUB_RUN_ID}"
-
-          # Pass original TLS label to CFN tag the same way as before (Weak/Secure)
-          TLS_LABEL="$(echo "${TLS_LC}" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
 
           echo "Stack: ${STACK_NAME}"
           aws cloudformation deploy \
@@ -305,7 +306,7 @@ jobs:
           ECR="${{ needs.validate-inputs.outputs.ecr_repo }}"
           if ! aws ecr describe-repositories --repository-names "${ECR}" >/dev/null 2>&1; then
             echo "ERROR: ECR repository '${ECR}' does not exist."
-            echo "Create it manually in AWS ECR (private) and ensure tag mutability is 'Mutable'."
+            echo "Create it manually in AWS ECR and ensure Tag mutability is 'Mutable'."
             exit 1
           fi
 
@@ -348,7 +349,7 @@ jobs:
 
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-          TLS_LC="${{ needs.validate-inputs.outputs.tls_mode }}"
+          TLS_LC="${{ needs.validate-inputs.outputs.tls_lc }}"
           DEBUG="${{ needs.validate-inputs.outputs.debug_logs }}"
 
           export IMAGE_URI TLS_LC DEBUG
@@ -416,7 +417,6 @@ jobs:
             "echo '=== Docker: ECR credential helper ==='",
             "sudo install -d -m 700 /root/.docker",
             f"echo '{b64_dcfg}' | base64 -d | sudo tee /root/.docker/config.json >/dev/null",
-            "sudo ls -l /root/.docker/config.json || true",
 
             "echo '=== Cert ==='",
             "sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 "
@@ -437,7 +437,6 @@ jobs:
             "echo '=== Diagnostics (slim) ==='",
             "echo 'listeners:'; sudo ss -lntp | egrep ':(443|:5000)\\b' || true",
             "echo 'nginx status:'; sudo systemctl status nginx --no-pager || true",
-            "echo 'nginx app.conf (head):'; sudo sed -n '1,200p' /etc/nginx/conf.d/app.conf || true",
             "echo 'nginx err (tail):'; sudo tail -n 120 /var/log/nginx/error.log || true",
             "echo 'petstore logs (tail):'; sudo docker logs --tail 200 petstore || true",
           ]
@@ -447,7 +446,6 @@ jobs:
                 "echo '=== Diagnostics (VERBOSE) ==='",
                 "echo 'nginx -T (head):'; sudo /usr/sbin/nginx -T 2>&1 | sed -n '1,400p' || true",
                 "echo 'docker ps -a:'; sudo docker ps -a || true",
-                "echo 'docker inspect petstore (head):'; sudo docker inspect petstore 2>/dev/null | sed -n '1,200p' || true",
                 "echo 'journalctl nginx (tail):'; sudo journalctl -u nginx --no-pager -n 200 || true",
                 "echo 'journalctl docker (tail):'; sudo journalctl -u docker --no-pager -n 200 || true",
               ]
@@ -504,9 +502,8 @@ jobs:
 
           APP_NAME="${{ needs.validate-inputs.outputs.app_name }}"
           SA_ACRONYM="${{ needs.validate-inputs.outputs.sa_acronym }}"
-          TLS_MODE="${{ needs.validate-inputs.outputs.tls_mode }}"
+          TLS_MODE="${{ needs.validate-inputs.outputs.tls_label }}"
           DEBUG_LOGS="${{ needs.validate-inputs.outputs.debug_logs }}"
-          AWS_REGION="${AWS_REGION}"
 
           DAST_URL="${{ needs.provision-ec2.outputs.dast_url }}"
           DNS_NAME="${{ needs.provision-ec2.outputs.dns_name }}"
