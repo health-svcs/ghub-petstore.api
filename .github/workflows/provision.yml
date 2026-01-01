@@ -1,4 +1,4 @@
-name: Provision EC2 + Build & Deploy API
+name: Provision EC2 + Build & Deploy API (petstore)
 
 on:
   workflow_dispatch:
@@ -37,15 +37,14 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
-  APP_NAME: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-  SA_ACRONYM: ${{ inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
-  TLS_MODE: ${{ inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
+  # Use workflow_dispatch inputs when present; otherwise fall back to repo vars for push events.
+  APP_NAME: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
+  SA_ACRONYM: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.SA_ACRONYM || vars.SA_ACRONYM_DEFAULT }}
+  TLS_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.TlsMode || vars.TLSMODE_DEFAULT || 'Weak' }}
+  DEBUG_LOGS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.DEBUG_LOGS || 'false' }}
 
-  # Boolean -> string "true"/"false"
-  DEBUG_LOGS: ${{ (inputs.DEBUG_LOGS && 'true') || 'false' }}
-
-  ECR_REPO_RAW: ${{ inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
-  IMAGE_TAG: ${{ github.run_id }}
+  # ECR repo name derived from app name (sanitized later)
+  ECR_REPO_RAW: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.APP_NAME || vars.APP_NAME_DEFAULT }}
 
   TEMPLATE_FILE: cloudformation/ec2.yaml
 
@@ -58,6 +57,13 @@ env:
 jobs:
   validate-inputs:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.compute.outputs.image_tag }}
+      ecr_repo: ${{ steps.compute.outputs.ecr_repo }}
+      app_name: ${{ steps.compute.outputs.app_name }}
+      sa_acronym: ${{ steps.compute.outputs.sa_acronym }}
+      tls_mode: ${{ steps.compute.outputs.tls_mode }}
+      debug_logs: ${{ steps.compute.outputs.debug_logs }}
     steps:
       - name: Validate required repo/org variables
         shell: bash
@@ -91,6 +97,49 @@ jobs:
             exit 1
           fi
 
+      - name: Compute stable ECR repo + stable image tag (2 tags per SA: weak/secure)
+        id: compute
+        shell: bash
+        run: |
+          set -euo pipefail
+          norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
+
+          APP="$(norm "${APP_NAME}")"
+          ACR="$(norm "${SA_ACRONYM}")"
+          TLS="$(norm "${TLS_MODE}")"
+          DBG="$(norm "${DEBUG_LOGS}")"
+
+          # normalize TLS to lowercase: weak|secure
+          TLS_LC="$(echo "${TLS}" | tr '[:upper:]' '[:lower:]')"
+          case "${TLS_LC}" in
+            weak|secure) ;;
+            *) echo "ERROR: TLS_MODE must be Weak or Secure, got '${TLS}'"; exit 1 ;;
+          esac
+
+          # stable tag per SA+mode: agc-weak / agc-secure
+          ACR_LC="$(echo "${ACR}" | tr '[:upper:]' '[:lower:]' | tr '_' '-' | tr -cd 'a-z0-9-' )"
+          [[ -n "${ACR_LC}" ]] || { echo "ERROR: SA_ACRONYM becomes empty after sanitization"; exit 1; }
+          IMAGE_TAG="${ACR_LC}-${TLS_LC}"
+
+          # ECR repo name: derived from app name, sanitized for ECR
+          SAFE_ECR="$(echo "${ECR_REPO_RAW:-petstore.api}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
+          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
+
+          echo "Computed:"
+          echo "  APP_NAME=${APP}"
+          echo "  SA_ACRONYM=${ACR_LC}"
+          echo "  TLS_MODE=${TLS_LC}"
+          echo "  IMAGE_TAG=${IMAGE_TAG}"
+          echo "  ECR_REPO=${SAFE_ECR}"
+          echo "  DEBUG_LOGS=${DBG}"
+
+          echo "app_name=${APP}" >> "$GITHUB_OUTPUT"
+          echo "sa_acronym=${ACR_LC}" >> "$GITHUB_OUTPUT"
+          echo "tls_mode=${TLS_LC}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
+          echo "debug_logs=${DBG}" >> "$GITHUB_OUTPUT"
+
   provision-ec2:
     runs-on: ubuntu-latest
     needs: validate-inputs
@@ -120,19 +169,22 @@ jobs:
           set -euo pipefail
           norm() { printf "%s" "$1" | tr -d '\r\n' | xargs; }
 
-          APP="$(norm "${APP_NAME}")"
-          ACR="$(norm "${SA_ACRONYM}")"
+          APP="$(norm "${{ needs.validate-inputs.outputs.app_name }}")"
+          ACR="$(norm "${{ needs.validate-inputs.outputs.sa_acronym }}")"
+          TLS_LC="$(norm "${{ needs.validate-inputs.outputs.tls_mode }}")"
+          IMAGE_TAG="$(norm "${{ needs.validate-inputs.outputs.image_tag }}")"
+          ECR_REPO="$(norm "${{ needs.validate-inputs.outputs.ecr_repo }}")"
           BASE="$(norm "${DNS_BASE_DOMAIN}")"
 
-          # Stack name: include ORG + REPO (repo already includes SA acronym), omit actor/app redundancy
-          ORG_NAME="${GITHUB_REPOSITORY%%/*}"     # e.g. health-svcs
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"    # e.g. agc-petstore.api
+          # Stack name: include ORG + REPO, unique per run id
+          ORG_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
           SAFE_ORG="$(echo "${ORG_NAME}"  | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           SAFE_REPO="$(echo "${REPO_NAME}" | tr '._' '-' | tr -cd 'a-zA-Z0-9-')"
           STACK_NAME="${SAFE_ORG}-${SAFE_REPO}-ec2-${GITHUB_RUN_ID}"
 
-          SAFE_ECR="$(echo "${ECR_REPO_RAW}" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | tr -cd 'a-z0-9/-')"
-          [[ -n "${SAFE_ECR}" ]] || SAFE_ECR="petstore-api"
+          # Pass original TLS label to CFN tag the same way as before (Weak/Secure)
+          TLS_LABEL="$(echo "${TLS_LC}" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
 
           echo "Stack: ${STACK_NAME}"
           aws cloudformation deploy \
@@ -147,8 +199,8 @@ jobs:
               "KeyName=${{ vars.KEY_NAME }}" \
               "DeployTagKey=DemoOwner" \
               "DeployTagValue=${DEMO_OWNER}" \
-              "AppName=${APP_NAME}" \
-              "TlsMode=${TLS_MODE}" \
+              "AppName=${APP}" \
+              "TlsMode=${TLS_LABEL}" \
               "ImageTag=${IMAGE_TAG}" \
               "RepoOrg=${GITHUB_REPOSITORY%%/*}" \
               "RepoName=${GITHUB_REPOSITORY##*/}" \
@@ -226,11 +278,11 @@ jobs:
           echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
           echo "dns_name=${DNS_NAME}" >> "$GITHUB_OUTPUT"
           echo "dast_url=${DAST_URL}" >> "$GITHUB_OUTPUT"
-          echo "ecr_repo=${SAFE_ECR}" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     runs-on: ubuntu-latest
-    needs: provision-ec2
+    needs: [validate-inputs, provision-ec2]
     permissions:
       id-token: write
       contents: read
@@ -246,22 +298,26 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Ensure ECR repo exists
+      - name: Verify ECR repo exists (manual create required)
         shell: bash
         run: |
           set -euo pipefail
-          ECR="${{ needs.provision-ec2.outputs.ecr_repo }}"
-          aws ecr describe-repositories --repository-names "${ECR}" >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name "${ECR}" >/dev/null
+          ECR="${{ needs.validate-inputs.outputs.ecr_repo }}"
+          if ! aws ecr describe-repositories --repository-names "${ECR}" >/dev/null 2>&1; then
+            echo "ERROR: ECR repository '${ECR}' does not exist."
+            echo "Create it manually in AWS ECR (private) and ensure tag mutability is 'Mutable'."
+            exit 1
+          fi
 
-      - name: Build & Push
+      - name: Build & Push (stable tag per SA+mode)
         id: img
         shell: bash
         run: |
           set -euo pipefail
-          ECR="${{ needs.provision-ec2.outputs.ecr_repo }}"
+          ECR="${{ needs.validate-inputs.outputs.ecr_repo }}"
+          TAG="${{ needs.validate-inputs.outputs.image_tag }}"
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          IMAGE_URI="${REGISTRY}/${ECR}:${IMAGE_TAG}"
+          IMAGE_URI="${REGISTRY}/${ECR}:${TAG}"
 
           aws ecr get-login-password --region "${AWS_REGION}" | \
             docker login --username AWS --password-stdin "${REGISTRY}"
@@ -273,7 +329,7 @@ jobs:
 
   deploy:
     runs-on: ubuntu-latest
-    needs: [provision-ec2, build-and-push]
+    needs: [validate-inputs, provision-ec2, build-and-push]
     permissions:
       id-token: write
       contents: read
@@ -292,16 +348,16 @@ jobs:
 
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-          TLS_MODE="${TLS_MODE}"
-          DEBUG="${DEBUG_LOGS}"
+          TLS_LC="${{ needs.validate-inputs.outputs.tls_mode }}"
+          DEBUG="${{ needs.validate-inputs.outputs.debug_logs }}"
 
-          export IMAGE_URI TLS_MODE DEBUG
+          export IMAGE_URI TLS_LC DEBUG
 
           python3 - <<'PY'
           import base64, json, os
 
           image = os.environ["IMAGE_URI"]
-          tls = (os.environ.get("TLS_MODE","Weak") or "Weak").strip().lower()
+          tls = (os.environ.get("TLS_LC","weak") or "weak").strip().lower()
           debug = (os.environ.get("DEBUG","false") or "false").strip().lower()
 
           if tls == "secure":
@@ -336,14 +392,11 @@ jobs:
           """
 
           docker_cfg = '{"credsStore":"ecr-login"}\n'
-
           b64_nginx = base64.b64encode(nginx_conf.encode()).decode()
           b64_dcfg  = base64.b64encode(docker_cfg.encode()).decode()
 
           commands = [
-            # IMPORTANT: SSM RunShellScript is executed by /bin/sh (dash). No pipefail.
             "set -eu",
-
             "echo '=== OS ==='; cat /etc/os-release || true",
 
             "echo '=== Defensive cleanup (docker repo + conflicts) ==='",
@@ -449,34 +502,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          # From workflow env / inputs
-          APP_NAME="${APP_NAME}"
-          SA_ACRONYM="${SA_ACRONYM}"
-          TLS_MODE="${TLS_MODE}"
-          DEBUG_LOGS="${DEBUG_LOGS}"
+          APP_NAME="${{ needs.validate-inputs.outputs.app_name }}"
+          SA_ACRONYM="${{ needs.validate-inputs.outputs.sa_acronym }}"
+          TLS_MODE="${{ needs.validate-inputs.outputs.tls_mode }}"
+          DEBUG_LOGS="${{ needs.validate-inputs.outputs.debug_logs }}"
           AWS_REGION="${AWS_REGION}"
 
-          # From provision-ec2 job outputs
           DAST_URL="${{ needs.provision-ec2.outputs.dast_url }}"
           DNS_NAME="${{ needs.provision-ec2.outputs.dns_name }}"
           PUBLIC_IP="${{ needs.provision-ec2.outputs.public_ip }}"
           INSTANCE_ID="${{ needs.provision-ec2.outputs.instance_id }}"
           ECR_REPO="${{ needs.provision-ec2.outputs.ecr_repo }}"
-
-          # From build-and-push outputs (available because this job needs build-and-push)
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          IMAGE_TAG="${{ needs.validate-inputs.outputs.image_tag }}"
 
-          # Keep normal log output
           echo "DAST URL:    ${DAST_URL}"
           echo "TLS Test:    ${DAST_URL}/tls-info"
           echo "DNS Name:    ${DNS_NAME}"
           echo "Public IP:   ${PUBLIC_IP}"
           echo "Instance ID: ${INSTANCE_ID}"
           echo "ECR Repo:    ${ECR_REPO}"
+          echo "Image Tag:   ${IMAGE_TAG}"
           echo "Image URI:   ${IMAGE_URI}"
           echo "DEBUG_LOGS:  ${DEBUG_LOGS}"
 
-          # GitHub Actions Summary
           {
             echo "## Deployment Summary"
             echo ""
@@ -495,5 +544,6 @@ jobs:
             echo "### 🖥️ Infrastructure"
             echo "- **Instance ID:** \`${INSTANCE_ID:-not-set}\`"
             echo "- **ECR Repo:** \`${ECR_REPO:-not-set}\`"
+            echo "- **Image Tag:** \`${IMAGE_TAG:-not-set}\`"
             echo "- **Image URI:** \`${IMAGE_URI:-not-set}\`"
           } >> "$GITHUB_STEP_SUMMARY"
