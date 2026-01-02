@@ -1,4 +1,4 @@
-### General notes  12-30-25 testing without NAT gateway
+### General notes  01-02-2026 running from org Vars
 
 This is a bit of a hack, in that both the app and the database (MairaDB) are on the same image/container.
 
