@@ -12,7 +12,7 @@ on:
       SA_ACRONYM:
         description: "3-letter SA acronym for stable DNS (agc, elg, etc)"
         required: true
-        default: "agc"
+        default: "ghub"
         type: string
 
       TlsMode:
