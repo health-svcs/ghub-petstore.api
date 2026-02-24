@@ -1,4 +1,4 @@
-### General notes  01-02-2026 running from org Vars
+### General notes  01-02-2026 running from org Vars - 2/24/26
 
 This is a bit of a hack, in that both the app and the database (MairaDB) are on the same image/container.
 
