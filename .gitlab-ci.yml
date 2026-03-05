@@ -1,0 +1,45 @@
+stages:
+    - security
+    - deploy
+
+veracode_scan:
+    image: veracode/api-wrapper-java:latest
+    stage: security
+    before_script:
+        - tar -zcvf upload.tar.gz api.py
+        - ls -lF
+    script:
+        # the scan WILL fail, so just fire and forget
+        - java -jar /opt/veracode/api-wrapper.jar -vid $VERACODE_API_ID -vkey $VERACODE_API_KEY
+            -action UploadAndScan -appname "VulnImages-PetstoreAPI" -createprofile false
+            -filepath upload.tar.gz -version "Commit ${CI_COMMIT_SHA:0:8} - Job $CI_JOB_ID"
+    allow_failure: true
+
+veracode_sca_scan:
+    image: python:3.8
+    stage: security
+    script:
+        - curl -sSL https://download.sourceclear.com/ci.sh | sh
+                    
+dockerize:
+    image: docker:stable
+    stage: deploy
+    variables:
+        DOCKER_DRIVER: overlay2
+        REPOSITORY_URL: $REPO_URL
+        DOCKER_TLS_CERTDIR: ""
+    services:
+        # docker:19.03+ has TLS on by default, see https://gitlab.com/gitlab-org/gitlab-runner/issues/4501#workaround
+        - docker:20.10-dind
+    before_script:
+        - apk add --update python3 py-pip
+        - pip3 install awscli
+    script:
+        - $(aws ecr get-login --no-include-email --region us-east-2)
+        - docker build -t petstore:$CI_PIPELINE_ID .
+        - docker tag petstore:$CI_PIPELINE_ID $REPOSITORY_URL:petstore-latest
+        - docker tag petstore:$CI_PIPELINE_ID $REPOSITORY_URL:petstore-$CI_PIPELINE_ID
+        - docker push $REPOSITORY_URL:petstore-latest
+        - docker push $REPOSITORY_URL:petstore-$CI_PIPELINE_ID
+    after_script:
+        - docker images
